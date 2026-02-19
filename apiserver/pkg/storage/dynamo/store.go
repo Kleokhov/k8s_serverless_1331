@@ -97,7 +97,13 @@ func New(
 		pathPrefix += "/"
 	}
 	if resourcePrefix == "" || resourcePrefix == "/" {
-		return nil, fmt.Errorf("invalid resource prefix: %q", resourcePrefix)
+		// Derive something stable so we don't crash on synthetic/internal resources.
+		// groupResource.String() is e.g. "apiServerIPInfo" or "endpoints".
+		gr := groupResource.String()
+		if gr == "" {
+			gr = "unknown"
+		}
+		resourcePrefix = "/" + gr
 	}
 	if !strings.HasPrefix(resourcePrefix, "/") {
 		return nil, fmt.Errorf("resourcePrefix needs to start from /")
@@ -122,6 +128,7 @@ func New(
 		if err := ensureMetaRow(ctx, ddb, tableName); err != nil {
 			return nil, err
 		}
+		fmt.Println("DynamoDB storage backend bootstrapped successfully.")
 	}
 
 	return s, nil

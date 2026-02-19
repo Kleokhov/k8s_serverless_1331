@@ -25,8 +25,8 @@ func newDynamoStorage(
 	resourcePrefix string,
 ) (storage.Interface, DestroyFunc, error) {
 
-	//// print out a test message
-	//fmt.Println("Initializing DynamoDB storage backend...")
+	// print out a test message
+	fmt.Println("Initializing DynamoDB storage backend...")
 	//
 	//return nil, nil, nil
 
