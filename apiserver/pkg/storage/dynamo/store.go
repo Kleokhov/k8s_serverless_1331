@@ -1215,16 +1215,7 @@ func (s *store) Watch(ctx context.Context, key string, opts storage.ListOptions)
 		return nil, apierrors.NewMethodNotSupported(s.groupResource, "watchlist/sendInitialEvents")
 	}
 
-	// No-op watch: never produces events, but doesn't error.
-	// Keeps informers from crashing the server during bring-up.
-	fw := watch.NewRaceFreeFake()
-
-	go func() {
-		<-ctx.Done()
-		fw.Stop()
-	}()
-
-	return fw, nil
+	return nil, apierrors.NewMethodNotSupported(s.groupResource, "watch")
 }
 
 // ReadinessCheck implements storage.Interface.ReadinessCheck.
