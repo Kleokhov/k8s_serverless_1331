@@ -14,6 +14,13 @@ WORKERS="${WORKERS:-0}"
 DO_BUILD=1
 KUBE_VERSION_BASE="${KUBE_VERSION_BASE:-v1.33.1}"
 
+STORAGE_BACKEND="${STORAGE_BACKEND:-etcd}"
+DYNAMO_REGION="${DYNAMO_REGION:-us-east-1}"
+DYNAMO_TABLE="${DYNAMO_TABLE:-dynamo}"
+DYNAMO_ENDPOINT="${DYNAMO_ENDPOINT:-http://dynamodb-local:8000}"
+DYNAMO_CONTAINER_NAME="${DYNAMO_CONTAINER_NAME:-dynamodb-local}"
+START_DYNAMO="${START_DYNAMO:-1}"
+
 usage() {
   cat <<EOF
 Usage: $0 [options]
@@ -24,20 +31,30 @@ Usage: $0 [options]
   --workers N           Number of worker nodes (default: $WORKERS)
   --no-build            Skip building; only recreate cluster using existing image
   --kube-version V      Base semver for stamping (default: $KUBE_VERSION_BASE)
+  --storage-backend B   Storage backend: etcd|dynamo (default: $STORAGE_BACKEND)
+  --dynamo-region R     DynamoDB region (default: $DYNAMO_REGION)
+  --dynamo-table T      DynamoDB table/base table (default: $DYNAMO_TABLE)
+  --dynamo-endpoint U   DynamoDB endpoint reachable from kind node (default: $DYNAMO_ENDPOINT)
+  --no-start-dynamo     Do not start local dynamodb-local container automatically
   -h|--help             Show help
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --k8s-dir)        K8S_DIR="$2"; shift 2 ;;
-    --apiserver-dir)  APISERVER_DIR="$2"; shift 2 ;;
-    --name)           CLUSTER_NAME="$2"; shift 2 ;;
-    --image)          KIND_IMAGE="$2"; shift 2 ;;
-    --workers)        WORKERS="$2"; shift 2 ;;
-    --no-build)       DO_BUILD=0; shift ;;
-    --kube-version)   KUBE_VERSION_BASE="$2"; shift 2 ;;
-    -h|--help)        usage; exit 0 ;;
+    --k8s-dir)          K8S_DIR="$2"; shift 2 ;;
+    --apiserver-dir)    APISERVER_DIR="$2"; shift 2 ;;
+    --name)             CLUSTER_NAME="$2"; shift 2 ;;
+    --image)            KIND_IMAGE="$2"; shift 2 ;;
+    --workers)          WORKERS="$2"; shift 2 ;;
+    --no-build)         DO_BUILD=0; shift ;;
+    --kube-version)     KUBE_VERSION_BASE="$2"; shift 2 ;;
+    --storage-backend)  STORAGE_BACKEND="$2"; shift 2 ;;
+    --dynamo-region)    DYNAMO_REGION="$2"; shift 2 ;;
+    --dynamo-table)     DYNAMO_TABLE="$2"; shift 2 ;;
+    --dynamo-endpoint)  DYNAMO_ENDPOINT="$2"; shift 2 ;;
+    --no-start-dynamo)  START_DYNAMO=0; shift ;;
+    -h|--help)          usage; exit 0 ;;
     *) echo "Unknown arg: $1"; usage; exit 2 ;;
   esac
 done
@@ -49,6 +66,7 @@ case "$ARCH" in
   *) echo "Unsupported arch: $(uname -m)"; exit 1 ;;
 esac
 
+# For WSL
 if [[ -f "$K8S_DIR/.git" && ! -d "$K8S_DIR/.git" ]]; then
   echo "Converting submodule gitfile → real .git/ directory"
   git -C "$TOPDIR" submodule absorbgitdirs "$(basename "$K8S_DIR")"
@@ -62,30 +80,7 @@ fi
 cd "$K8S_DIR"
 [[ -f go.work ]] || { echo "ERROR: $K8S_DIR/go.work not found"; exit 1; }
 
-WORK_BAK="$(mktemp)"
-WORKSUM_BAK="$(mktemp)"
-RESTORE_WORK=0
-
-# Track whether vendor changed, so we can revert it if requested.
-VENDOR_DIR="$K8S_DIR/vendor"
-VENDOR_WAS_DIRTY=0
-
-cleanup() {
-  if [[ "$RESTORE_WORK" -eq 1 ]]; then
-    echo "==> Restoring original go.work"
-    cp "$WORK_BAK" "$K8S_DIR/go.work"
-    if [[ -s "$WORKSUM_BAK" ]]; then
-      cp "$WORKSUM_BAK" "$K8S_DIR/go.work.sum"
-    else
-      rm -f "$K8S_DIR/go.work.sum" || true
-    fi
-  fi
-
-  rm -f "$WORK_BAK" "$WORKSUM_BAK" || true
-}
-trap cleanup EXIT
-
-# --- Mirror apiserver into kubernetes/_local/apiserver -----------------------
+# Copying local apiserver into kubernetes/_local/apiserver
 OVERLAY_REL="_local/apiserver"
 OVERLAY_DIR="$K8S_DIR/$OVERLAY_REL"
 
@@ -106,16 +101,8 @@ if [[ -d "$K8S_DIR/.git" ]]; then
   fi
 fi
 
-# --- Patch go.work to use ./_local/apiserver --------------------------------
-echo "==> Temporarily patching go.work to use ./$OVERLAY_REL"
-cp "$K8S_DIR/go.work" "$WORK_BAK"
-RESTORE_WORK=1
-if [[ -f "$K8S_DIR/go.work.sum" ]]; then
-  cp "$K8S_DIR/go.work.sum" "$WORKSUM_BAK"
-else
-  : > "$WORKSUM_BAK"
-fi
-
+# Point go.work at ./_local/apiserver (Permanent)
+echo "==> Ensuring go.work uses ./$OVERLAY_REL"
 if grep -qE '^\s*\.\./apiserver\s*$' go.work; then
   go work edit -dropuse=../apiserver
 fi
@@ -124,31 +111,18 @@ if ! grep -qE "^\s*\./${OVERLAY_REL}\s*$" go.work; then
 fi
 go work sync
 
-# --- Version stamp -----------------------------------------------------------
 KUBE_GIT_COMMIT="$(git -C "$K8S_DIR" rev-parse --short HEAD 2>/dev/null || echo 'local')"
 export KUBE_GIT_COMMIT
 export KUBE_GIT_TREE_STATE=clean
 export KUBE_GIT_VERSION="${KUBE_VERSION_BASE}-${KUBE_GIT_COMMIT}"
 echo "==> Using version stamp: KUBE_GIT_VERSION=$KUBE_GIT_VERSION"
 
-# --- Workspace + vendor ---------------------------
-# In workspace mode, -mod can only be readonly or vendor.
 export GOFLAGS="-buildvcs=false -mod=vendor"
 echo "==> Using GOFLAGS=$GOFLAGS"
 
 echo "==> Running 'go work vendor' to sync vendor/ for workspace"
-# Mark dirty before/after so we can revert if desired
-if git -C "$K8S_DIR" diff --quiet -- vendor/ 2>/dev/null; then
-  : # clean
-else
-  VENDOR_WAS_DIRTY=1
-fi
 go work vendor
-if ! git -C "$K8S_DIR" diff --quiet -- vendor/ 2>/dev/null; then
-  VENDOR_WAS_DIRTY=1
-fi
 
-# --- Build Kubernetes tarball ------------------------------------------------
 if [[ "$DO_BUILD" -eq 1 ]]; then
   echo "==> Building Kubernetes quick-release for linux/$ARCH"
   export KUBE_BUILD_PLATFORMS="linux/$ARCH"
@@ -163,33 +137,49 @@ if [[ ! -f "$TARBALL" ]]; then
   exit 1
 fi
 
-# --- Build kind node image from the tarball ---------------------------------
 echo "==> Building kind node image from tarball: $KIND_IMAGE"
 kind build node-image \
   --type file "$TARBALL" \
   --image "$KIND_IMAGE"
 
-# --- Create cluster ----------------------------------------------------------
+if [[ "$STORAGE_BACKEND" == "dynamo" && "$START_DYNAMO" -eq 1 ]]; then
+  echo "==> Ensuring local DynamoDB container is running"
+  docker rm -f "$DYNAMO_CONTAINER_NAME" >/dev/null 2>&1 || true
+  docker network inspect kind >/dev/null 2>&1 || docker network create kind
+  docker run -d \
+    --name "$DYNAMO_CONTAINER_NAME" \
+    --network kind \
+    amazon/dynamodb-local \
+    -jar DynamoDBLocal.jar -inMemory -sharedDb >/dev/null
+fi
+
 echo "==> Recreating kind cluster: $CLUSTER_NAME"
 kind delete cluster --name "$CLUSTER_NAME" >/dev/null 2>&1 || true
 
 KIND_CFG="$(mktemp)"
+trap 'rm -f "$KIND_CFG"' EXIT
+
 {
   echo "kind: Cluster"
   echo "apiVersion: kind.x-k8s.io/v1alpha4"
-
-  # Patch kubeadm's ClusterConfiguration that kind uses during kubeadm init
-  echo "kubeadmConfigPatches:"
-  echo "- |"
-  echo "  apiVersion: kubeadm.k8s.io/v1beta3"
-  echo "  kind: ClusterConfiguration"
-  echo "  apiServer:"
-  echo "    extraArgs:"
-  echo "      authorization-mode: \"Node,RBAC\""
-  echo "      anonymous-auth: \"true\""
-
   echo "nodes:"
   echo "- role: control-plane"
+  echo "  kubeadmConfigPatches:"
+  echo "  - |"
+  echo "    apiVersion: kubeadm.k8s.io/v1beta3"
+  echo "    kind: ClusterConfiguration"
+  echo "    apiServer:"
+  echo "      extraArgs:"
+  echo "        authorization-mode: \"Node,RBAC\""
+  echo "        anonymous-auth: \"true\""
+  echo "        storage-backend: \"$STORAGE_BACKEND\""
+
+  if [[ "$STORAGE_BACKEND" == "dynamo" ]]; then
+    echo "        dynamo-region: \"$DYNAMO_REGION\""
+    echo "        dynamo-table: \"$DYNAMO_TABLE\""
+    echo "        dynamo-endpoint: \"$DYNAMO_ENDPOINT\""
+  fi
+
   for ((i=0; i<WORKERS; i++)); do
     echo "- role: worker"
   done
