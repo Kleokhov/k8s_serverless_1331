@@ -4,22 +4,26 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 TOPDIR="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || echo "$SCRIPT_DIR")"
 
+AWS_DIR="${AWS_DIR:-$HOME/.aws}"
 K8S_DIR="${K8S_DIR:-$TOPDIR/kubernetes}"
 APISERVER_DIR="${APISERVER_DIR:-$TOPDIR/apiserver}"
 
-CLUSTER_NAME="${CLUSTER_NAME:-local-apiserver}"
+CLUSTER_NAME="${CLUSTER_NAME:-kind}"
 KIND_IMAGE="${KIND_IMAGE:-kindest-local:dev}"
 WORKERS="${WORKERS:-0}"
 
 DO_BUILD=1
 KUBE_VERSION_BASE="${KUBE_VERSION_BASE:-v1.33.1}"
 
+# Script-level storage modes:
+#   etcd          -> kube-apiserver --storage-backend=etcd3
+#   dynamo-local  -> kube-apiserver --storage-backend=dynamo + --dynamo-endpoint=...
+#   dynamo-aws    -> kube-apiserver --storage-backend=dynamo (no endpoint)
 STORAGE_BACKEND="${STORAGE_BACKEND:-etcd}"
 DYNAMO_REGION="${DYNAMO_REGION:-us-east-1}"
 DYNAMO_TABLE="${DYNAMO_TABLE:-dynamo}"
 DYNAMO_ENDPOINT="${DYNAMO_ENDPOINT:-http://dynamodb-local:8000}"
 DYNAMO_CONTAINER_NAME="${DYNAMO_CONTAINER_NAME:-dynamodb-local}"
-START_DYNAMO="${START_DYNAMO:-1}"
 
 usage() {
   cat <<EOF
@@ -31,11 +35,10 @@ Usage: $0 [options]
   --workers N           Number of worker nodes (default: $WORKERS)
   --no-build            Skip building; only recreate cluster using existing image
   --kube-version V      Base semver for stamping (default: $KUBE_VERSION_BASE)
-  --storage-backend B   Storage backend: etcd|dynamo (default: $STORAGE_BACKEND)
+  --storage-backend B   Storage mode: etcd|dynamo-local|dynamo-aws (default: $STORAGE_BACKEND)
   --dynamo-region R     DynamoDB region (default: $DYNAMO_REGION)
   --dynamo-table T      DynamoDB table/base table (default: $DYNAMO_TABLE)
-  --dynamo-endpoint U   DynamoDB endpoint reachable from kind node (default: $DYNAMO_ENDPOINT)
-  --no-start-dynamo     Do not start local dynamodb-local container automatically
+  --dynamo-endpoint U   DynamoDB endpoint for local mode (default: $DYNAMO_ENDPOINT)
   -h|--help             Show help
 EOF
 }
@@ -53,11 +56,35 @@ while [[ $# -gt 0 ]]; do
     --dynamo-region)    DYNAMO_REGION="$2"; shift 2 ;;
     --dynamo-table)     DYNAMO_TABLE="$2"; shift 2 ;;
     --dynamo-endpoint)  DYNAMO_ENDPOINT="$2"; shift 2 ;;
-    --no-start-dynamo)  START_DYNAMO=0; shift ;;
     -h|--help)          usage; exit 0 ;;
     *) echo "Unknown arg: $1"; usage; exit 2 ;;
   esac
 done
+
+APISERVER_STORAGE_BACKEND=""
+USE_DYNAMO=0
+USE_LOCAL_DYNAMO=0
+USE_AWS_DYNAMO=0
+
+case "$STORAGE_BACKEND" in
+  etcd)
+    APISERVER_STORAGE_BACKEND="etcd3"
+    ;;
+  dynamo-local)
+    APISERVER_STORAGE_BACKEND="dynamo"
+    USE_DYNAMO=1
+    USE_LOCAL_DYNAMO=1
+    ;;
+  dynamo-aws)
+    APISERVER_STORAGE_BACKEND="dynamo"
+    USE_DYNAMO=1
+    USE_AWS_DYNAMO=1
+    ;;
+  *)
+    echo "ERROR: unsupported --storage-backend=$STORAGE_BACKEND (expected: etcd|dynamo-local|dynamo-aws)"
+    exit 2
+    ;;
+esac
 
 ARCH="$(uname -m)"
 case "$ARCH" in
@@ -72,8 +99,8 @@ if [[ -f "$K8S_DIR/.git" && ! -d "$K8S_DIR/.git" ]]; then
   git -C "$TOPDIR" submodule absorbgitdirs "$(basename "$K8S_DIR")"
 fi
 
-if grep -qi microsoft /proc/version 2>/dev/null; then
-  export KUBE_RSYNC_PORT=39999
+if grep -qiE '(microsoft|wsl)' /proc/version /proc/sys/kernel/osrelease 2>/dev/null; then
+  export KUBE_RSYNC_PORT="${KUBE_RSYNC_PORT:-39999}"
   export KUBE_BUILD_NO_HOSTNETWORK=1
 fi
 
@@ -142,7 +169,7 @@ kind build node-image \
   --type file "$TARBALL" \
   --image "$KIND_IMAGE"
 
-if [[ "$STORAGE_BACKEND" == "dynamo" && "$START_DYNAMO" -eq 1 ]]; then
+if [[ "$USE_LOCAL_DYNAMO" -eq 1 ]]; then
   echo "==> Ensuring local DynamoDB container is running"
   docker rm -f "$DYNAMO_CONTAINER_NAME" >/dev/null 2>&1 || true
   docker network inspect kind >/dev/null 2>&1 || docker network create kind
@@ -151,6 +178,11 @@ if [[ "$STORAGE_BACKEND" == "dynamo" && "$START_DYNAMO" -eq 1 ]]; then
     --network kind \
     amazon/dynamodb-local \
     -jar DynamoDBLocal.jar -inMemory -sharedDb >/dev/null
+fi
+
+if [[ "$USE_AWS_DYNAMO" -eq 1 && ! -d "$AWS_DIR" ]]; then
+  echo "ERROR: AWS shared config directory not found: $AWS_DIR"
+  exit 1
 fi
 
 echo "==> Recreating kind cluster: $CLUSTER_NAME"
@@ -164,20 +196,40 @@ trap 'rm -f "$KIND_CFG"' EXIT
   echo "apiVersion: kind.x-k8s.io/v1alpha4"
   echo "nodes:"
   echo "- role: control-plane"
+
+  if [[ "$USE_AWS_DYNAMO" -eq 1 ]]; then
+    echo "  extraMounts:"
+    echo "  - hostPath: \"$AWS_DIR\""
+    echo "    containerPath: /root/.aws"
+    echo "    readOnly: true"
+  fi
+
   echo "  kubeadmConfigPatches:"
   echo "  - |"
   echo "    apiVersion: kubeadm.k8s.io/v1beta3"
   echo "    kind: ClusterConfiguration"
   echo "    apiServer:"
   echo "      extraArgs:"
+  echo '        v: "4"'
   echo "        authorization-mode: \"Node,RBAC\""
   echo "        anonymous-auth: \"true\""
-  echo "        storage-backend: \"$STORAGE_BACKEND\""
+  echo "        storage-backend: \"$APISERVER_STORAGE_BACKEND\""
 
-  if [[ "$STORAGE_BACKEND" == "dynamo" ]]; then
+  if [[ "$USE_DYNAMO" -eq 1 ]]; then
     echo "        dynamo-region: \"$DYNAMO_REGION\""
     echo "        dynamo-table: \"$DYNAMO_TABLE\""
-    echo "        dynamo-endpoint: \"$DYNAMO_ENDPOINT\""
+    if [[ "$USE_LOCAL_DYNAMO" -eq 1 ]]; then
+      echo "        dynamo-endpoint: \"$DYNAMO_ENDPOINT\""
+    fi
+  fi
+
+  if [[ "$USE_AWS_DYNAMO" -eq 1 ]]; then
+    echo "      extraVolumes:"
+    echo "      - name: aws-creds"
+    echo "        hostPath: /root/.aws"
+    echo "        mountPath: /root/.aws"
+    echo "        readOnly: true"
+    echo "        pathType: DirectoryOrCreate"
   fi
 
   for ((i=0; i<WORKERS; i++)); do
@@ -190,3 +242,29 @@ kind create cluster \
   --image "$KIND_IMAGE" \
   --config "$KIND_CFG" \
   --retain
+
+if [[ "$USE_DYNAMO" -eq 1 ]]; then
+  echo "==> Removing kubeadm-added etcd flags from kube-apiserver manifest"
+  docker exec "${CLUSTER_NAME}-control-plane" sh -lc '
+    f=/etc/kubernetes/manifests/kube-apiserver.yaml
+    tmp=$(mktemp)
+    grep -v -- "--etcd-servers=" "$f" | grep -v -- "--etcd-servers-overrides=" > "$tmp"
+    cat "$tmp" > "$f"
+    rm -f "$tmp"
+  '
+
+  echo "==> Waiting for kube-apiserver to restart with DynamoDB storage"
+  ready=0
+  for _ in $(seq 1 60); do
+    if kubectl --context "kind-${CLUSTER_NAME}" version --request-timeout=5s >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 2
+  done
+
+  if [[ "$ready" -ne 1 ]]; then
+    echo "ERROR: kube-apiserver did not become ready after switching to $STORAGE_BACKEND"
+    exit 1
+  fi
+fi

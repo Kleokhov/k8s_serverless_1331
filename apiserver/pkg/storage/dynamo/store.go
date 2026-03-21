@@ -166,7 +166,7 @@ func EnsureResourceTable(ctx context.Context, ddb *dynamodb.Client, tableName st
 	waiter := dynamodb.NewTableExistsWaiter(ddb)
 	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
-	if err := waiter.Wait(waitCtx, &dynamodb.DescribeTableInput{TableName: aws.String(tableName)}, 15*time.Second); err != nil {
+	if err := waiter.Wait(waitCtx, &dynamodb.DescribeTableInput{TableName: aws.String(tableName)}, 60*time.Second); err != nil {
 		return fmt.Errorf("wait for table %s to exist: %w", tableName, err)
 	}
 
