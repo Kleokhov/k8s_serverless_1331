@@ -1,0 +1,5 @@
+/k3s
+/kine
+
+# Ignore all .txt files
+*.txt

@@ -1,3 +1,6 @@
 [submodule "kubernetes"]
 	path = kubernetes
 	url = https://github.com/spyrospav/kubernetes.git
+[submodule "apiserver"]
+	path = apiserver
+	url = git@github.com:Kleokhov/apiserver.git
