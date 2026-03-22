@@ -48,7 +48,7 @@ func newDynamoStorage(
 		return nil, nil, err
 	}
 
-	bootstrap := true
+	bootstrap := c.Dynamo.Endpoint != ""
 
 	s, err := dynamo.New(
 		context.Background(),

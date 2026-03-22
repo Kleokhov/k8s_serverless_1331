@@ -24,6 +24,7 @@ DYNAMO_REGION="${DYNAMO_REGION:-us-east-1}"
 DYNAMO_TABLE="${DYNAMO_TABLE:-dynamo}"
 DYNAMO_ENDPOINT="${DYNAMO_ENDPOINT:-http://dynamodb-local:8000}"
 DYNAMO_CONTAINER_NAME="${DYNAMO_CONTAINER_NAME:-dynamodb-local}"
+PRECREATE_DYNAMO_TABLES_SCRIPT="${PRECREATE_DYNAMO_TABLES_SCRIPT:-$TOPDIR/precreate_dynamo_tables.sh}"
 
 usage() {
   cat <<EOF
@@ -185,6 +186,19 @@ if [[ "$USE_AWS_DYNAMO" -eq 1 && ! -d "$AWS_DIR" ]]; then
   exit 1
 fi
 
+if [[ "$USE_AWS_DYNAMO" -eq 1 ]]; then
+  [[ -x "$PRECREATE_DYNAMO_TABLES_SCRIPT" ]] || {
+    echo "ERROR: precreate script not found or not executable: $PRECREATE_DYNAMO_TABLES_SCRIPT"
+    exit 1
+  }
+
+  echo "==> Precreating DynamoDB tables for AWS backend"
+  APISERVER_DIR="$APISERVER_DIR" \
+  DYNAMO_REGION="$DYNAMO_REGION" \
+  DYNAMO_TABLE="$DYNAMO_TABLE" \
+  "$PRECREATE_DYNAMO_TABLES_SCRIPT"
+fi
+
 echo "==> Recreating kind cluster: $CLUSTER_NAME"
 kind delete cluster --name "$CLUSTER_NAME" >/dev/null 2>&1 || true
 
@@ -242,29 +256,3 @@ kind create cluster \
   --image "$KIND_IMAGE" \
   --config "$KIND_CFG" \
   --retain
-
-if [[ "$USE_DYNAMO" -eq 1 ]]; then
-  echo "==> Removing kubeadm-added etcd flags from kube-apiserver manifest"
-  docker exec "${CLUSTER_NAME}-control-plane" sh -lc '
-    f=/etc/kubernetes/manifests/kube-apiserver.yaml
-    tmp=$(mktemp)
-    grep -v -- "--etcd-servers=" "$f" | grep -v -- "--etcd-servers-overrides=" > "$tmp"
-    cat "$tmp" > "$f"
-    rm -f "$tmp"
-  '
-
-  echo "==> Waiting for kube-apiserver to restart with DynamoDB storage"
-  ready=0
-  for _ in $(seq 1 60); do
-    if kubectl --context "kind-${CLUSTER_NAME}" version --request-timeout=5s >/dev/null 2>&1; then
-      ready=1
-      break
-    fi
-    sleep 2
-  done
-
-  if [[ "$ready" -ne 1 ]]; then
-    echo "ERROR: kube-apiserver did not become ready after switching to $STORAGE_BACKEND"
-    exit 1
-  fi
-fi

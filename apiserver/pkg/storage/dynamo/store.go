@@ -3,13 +3,11 @@ package dynamo
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"path"
 	"reflect"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -122,91 +120,13 @@ func New(
 	}
 
 	if bootstrap {
-		if err := EnsureResourceTable(ctx, ddb, tableName); err != nil {
+		if err := EnsureTableBootstrap(ctx, ddb, tableName); err != nil {
 			return nil, err
 		}
-		if err := ensureMetaRow(ctx, ddb, tableName); err != nil {
-			return nil, err
-		}
-		fmt.Println("DynamoDB storage backend bootstrapped successfully.")
+		fmt.Printf("DynamoDB storage backend bootstrapped for table: %s\n", tableName)
 	}
 
 	return s, nil
-}
-
-// EnsureResourceTable creates the per-resource table if it does not exist.
-// It also enables TTL on attribute "ttl" best-effort (ignores errors that indicate it's already set).
-func EnsureResourceTable(ctx context.Context, ddb *dynamodb.Client, tableName string) error {
-	// Fast path: already exists.
-	_, err := ddb.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(tableName)})
-	if err == nil {
-		return nil
-	}
-	var rnfe *ddbtypes.ResourceNotFoundException
-	if !errors.As(err, &rnfe) {
-		return fmt.Errorf("DescribeTable(%s): %w", tableName, err)
-	}
-
-	_, err = ddb.CreateTable(ctx, &dynamodb.CreateTableInput{
-		TableName:   aws.String(tableName),
-		BillingMode: ddbtypes.BillingModePayPerRequest,
-		AttributeDefinitions: []ddbtypes.AttributeDefinition{
-			{AttributeName: aws.String(attrPK), AttributeType: ddbtypes.ScalarAttributeTypeS},
-			{AttributeName: aws.String(attrSK), AttributeType: ddbtypes.ScalarAttributeTypeS},
-		},
-		KeySchema: []ddbtypes.KeySchemaElement{
-			{AttributeName: aws.String(attrPK), KeyType: ddbtypes.KeyTypeHash},
-			{AttributeName: aws.String(attrSK), KeyType: ddbtypes.KeyTypeRange},
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("CreateTable(%s): %w", tableName, err)
-	}
-
-	waiter := dynamodb.NewTableExistsWaiter(ddb)
-	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-	defer cancel()
-	if err := waiter.Wait(waitCtx, &dynamodb.DescribeTableInput{TableName: aws.String(tableName)}, 60*time.Second); err != nil {
-		return fmt.Errorf("wait for table %s to exist: %w", tableName, err)
-	}
-
-	// TODO: double-check TTL expiration
-	// Best-effort TTL enablement (safe to ignore failures if permissions not granted).
-	_, _ = ddb.UpdateTimeToLive(ctx, &dynamodb.UpdateTimeToLiveInput{
-		TableName: aws.String(tableName),
-		TimeToLiveSpecification: &ddbtypes.TimeToLiveSpecification{
-			AttributeName: aws.String(ttlAttribute),
-			Enabled:       aws.Bool(true),
-		},
-	})
-
-	return nil
-}
-
-// ensureMetaRow creates the meta row if it doesn't exist.
-func ensureMetaRow(ctx context.Context, ddb *dynamodb.Client, tableName string) error {
-	// Create meta row if it doesn't exist.
-	_, err := ddb.PutItem(ctx, &dynamodb.PutItemInput{
-		TableName: aws.String(tableName),
-		Item: map[string]ddbtypes.AttributeValue{
-			attrPK:        &ddbtypes.AttributeValueMemberS{Value: metaPK},
-			attrSK:        &ddbtypes.AttributeValueMemberS{Value: metaSK},
-			attrCurrentRV: &ddbtypes.AttributeValueMemberN{Value: strconv.FormatUint(minInitialRV, 10)},
-		},
-		ConditionExpression: aws.String("attribute_not_exists(#pk)"),
-		ExpressionAttributeNames: map[string]string{
-			"#pk": attrPK,
-		},
-	})
-	if err == nil {
-		return nil
-	}
-	var cfe *ddbtypes.ConditionalCheckFailedException
-	if errors.As(err, &cfe) {
-		// already exists
-		return nil
-	}
-	return fmt.Errorf("PutItem(meta row) table=%s: %w", tableName, err)
 }
 
 // validateMinimumResourceVersion returns a 'too large resource' version error when the provided minimumResourceVersion is
