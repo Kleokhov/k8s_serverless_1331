@@ -4,7 +4,8 @@
 # Ignore all .txt files
 *.txt
 .codex
-*.md
+#*.md
+kube-apiserver-init-path.md
 
 /_*
 **/_output
