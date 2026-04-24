@@ -3,9 +3,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 REPO_LOCAL_DIR="${REPO_LOCAL_DIR:-$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null || (cd "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd))}"
-OUT_DIR="${OUT_DIR:-${REPO_LOCAL_DIR}/_ec2_out}"
+OUT_DIR="${OUT_DIR:-${REPO_LOCAL_DIR}/_serverless_out}"
 
-export KUBECONFIG="${KUBECONFIG:-${OUT_DIR}/admin.public.conf}"
+export KUBECONFIG="${KUBECONFIG:-${OUT_DIR}/lambda-apiserver.kubeconfig}"
 NS="${NS:-hello-test}"
 JOB_BASENAME="${JOB_BASENAME:-scheduler-saturation-test}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%d%H%M%S)}"

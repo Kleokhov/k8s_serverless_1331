@@ -12,8 +12,6 @@ Lambda apiserver MVP.
 Options:
   --kubeconfig PATH       Kubeconfig containing server and bearer token.
   --namespaces LIST       Comma-separated namespaces to create.
-  --synthetic-nodes N     Number of synthetic Nodes to create (default: 0).
-  --node-prefix PREFIX    Synthetic node prefix (default: serverless-node).
   -h, --help              Show help.
 EOF
 }
@@ -27,15 +25,11 @@ need() {
 
 KUBECONFIG_PATH=""
 NAMESPACES="default,kube-system,kube-public,kube-node-lease"
-SYNTHETIC_NODES=0
-NODE_PREFIX="serverless-node"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --kubeconfig) KUBECONFIG_PATH="$2"; shift 2 ;;
     --namespaces) NAMESPACES="$2"; shift 2 ;;
-    --synthetic-nodes) SYNTHETIC_NODES="$2"; shift 2 ;;
-    --node-prefix) NODE_PREFIX="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *)
       echo "Unknown argument: $1"
@@ -71,40 +65,55 @@ api_request() {
   local payload="$4"
   local label="$5"
   local code
+  local attempt
+  local max_attempts="${API_REQUEST_MAX_ATTEMPTS:-6}"
+  local delay=2
 
   printf '%s' "${payload}" > "${request_body_file}"
-  code="$(
-    curl -sS -k \
-      -o "${response_body_file}" \
-      -w '%{http_code}' \
-      -X "${method}" \
-      -H "Authorization: Bearer ${token}" \
-      -H "Content-Type: ${content_type}" \
-      --data-binary @"${request_body_file}" \
-      "${server}${path}"
-  )"
 
-  case "${code}" in
-    200|201)
-      echo "  ensured ${label}"
-      ;;
-    409)
-      echo "  exists  ${label}"
-      ;;
-    *)
-      echo "Failed to ${method} ${label} at ${path}: HTTP ${code}"
-      sed -n '1,80p' "${response_body_file}"
-      if [[ "${code}" == "502" ]]; then
-        cat <<'EOF'
+  for ((attempt=1; attempt<=max_attempts; attempt++)); do
+    code="$(
+      curl -sS -k \
+        -o "${response_body_file}" \
+        -w '%{http_code}' \
+        -X "${method}" \
+        -H "Authorization: Bearer ${token}" \
+        -H "Content-Type: ${content_type}" \
+        --data-binary @"${request_body_file}" \
+        "${server}${path}"
+    )" || code="000"
+
+    case "${code}" in
+      200|201)
+        echo "  ensured ${label}"
+        return 0
+        ;;
+      409)
+        echo "  exists  ${label}"
+        return 0
+        ;;
+      403|429|500|502|503|504|000)
+        if (( attempt < max_attempts )); then
+          echo "  retry ${attempt}/${max_attempts} ${label}: HTTP ${code} (likely transient API Gateway/Lambda warmup)"
+          sleep "${delay}"
+          delay=$(( delay * 2 ))
+          continue
+        fi
+        ;;
+    esac
+
+    echo "Failed to ${method} ${label} at ${path}: HTTP ${code}"
+    sed -n '1,80p' "${response_body_file}"
+    if [[ "${code}" == "502" ]]; then
+      cat <<'EOF'
 HTTP 502 means API Gateway could not get a valid response from the Lambda
 apiserver. Check CloudWatch logs for the Lambda function; after changing
 lambda/cmd/apiserver or lambda/pkg/apiserver, redeploy the apiserver image
 before retrying seed-only.
 EOF
-      fi
-      return 1
-      ;;
-  esac
+    fi
+    return 1
+  done
 }
 
 seed_namespace() {
@@ -114,64 +123,6 @@ seed_namespace() {
   api_request POST "/api/v1/namespaces" "application/json" "${payload}" "namespace/${name}"
 }
 
-seed_synthetic_node() {
-  local name="$1"
-  local create_payload status_payload
-  create_payload="$(cat <<EOF
-{
-  "apiVersion": "v1",
-  "kind": "Node",
-  "metadata": {
-    "name": "${name}",
-    "labels": {
-      "kubernetes.io/hostname": "${name}",
-      "kubernetes.io/os": "linux",
-      "kubernetes.io/arch": "amd64",
-      "node.kubernetes.io/instance-type": "lambda-synthetic"
-    }
-  },
-  "spec": {}
-}
-EOF
-)"
-  api_request POST "/api/v1/nodes" "application/json" "${create_payload}" "node/${name}"
-
-  status_payload="$(cat <<EOF
-{
-  "status": {
-    "capacity": {
-      "cpu": "4",
-      "memory": "16Gi",
-      "pods": "110"
-    },
-    "allocatable": {
-      "cpu": "4",
-      "memory": "16Gi",
-      "pods": "110"
-    },
-    "conditions": [
-      {
-        "type": "Ready",
-        "status": "True",
-        "reason": "SyntheticNodeReady",
-        "message": "Synthetic node seeded for Lambda scheduler experiments"
-      }
-    ],
-    "nodeInfo": {
-      "architecture": "amd64",
-      "operatingSystem": "linux",
-      "kubeletVersion": "v1.33.1",
-      "containerRuntimeVersion": "containerd://synthetic",
-      "kernelVersion": "synthetic",
-      "osImage": "synthetic"
-    }
-  }
-}
-EOF
-)"
-  api_request PATCH "/api/v1/nodes/${name}/status" "application/strategic-merge-patch+json" "${status_payload}" "node/${name}/status"
-}
-
 if [[ -n "${NAMESPACES}" ]]; then
   echo "[*] Seeding namespaces via raw REST"
   IFS=',' read -r -a namespace_items <<<"${NAMESPACES}"
@@ -179,12 +130,5 @@ if [[ -n "${NAMESPACES}" ]]; then
     namespace="${namespace//[[:space:]]/}"
     [[ -n "${namespace}" ]] || continue
     seed_namespace "${namespace}"
-  done
-fi
-
-if [[ "${SYNTHETIC_NODES}" != "0" ]]; then
-  echo "[*] Seeding ${SYNTHETIC_NODES} synthetic node(s) via raw REST"
-  for i in $(seq 1 "${SYNTHETIC_NODES}"); do
-    seed_synthetic_node "$(printf '%s-%02d' "${NODE_PREFIX}" "${i}")"
   done
 fi

@@ -40,16 +40,18 @@ Options:
       --scheduler-log-prefix P      CloudWatch /aws/lambda prefix to sweep
                                     for the scheduler/controller functions
                                     (default: <scheduler-stack>-)
-      --sam-managed-stack NAME      SAM-managed CloudFormation stack holding
-                                    the shared artifact bucket
-                                    (default: aws-sam-cli-managed-default)
+      --apiserver-artifact-bucket B S3 bucket containing apiserver SAM artifacts
+      --scheduler-artifact-bucket B S3 bucket containing scheduler/controller
+                                    SAM artifacts
       --keep-local-files            Do not remove the local kubeconfig or
                                     workers.env files.
       --keep-dynamo                 Do not delete the apiserver DynamoDB tables.
       --keep-ssm                    Do not delete the kubeconfig SSM parameter.
       --keep-log-groups             Do not delete CloudWatch log groups.
-      --keep-sam-bucket             Do not delete the SAM-managed artifact
-                                    bucket or its CloudFormation stack.
+      --keep-artifact-buckets       Do not empty/delete component SAM artifact
+                                    buckets.
+      --keep-sam-bucket             Backward-compatible alias for
+                                    --keep-artifact-buckets.
   -y, --yes                         Skip confirmation prompts.
   -h, --help                        Show this help.
 
@@ -57,7 +59,7 @@ Environment overrides:
   AWS_REGION, TAG_PREFIX, SERVERLESS_RESOURCE_PREFIX,
   APISERVER_STACK_NAME, SCHEDULER_STACK_NAME,
   APISERVER_DYNAMO_TABLE, KUBECONFIG_PARAMETER_NAME,
-  SAM_MANAGED_STACK_NAME
+  APISERVER_ARTIFACT_BUCKET, SCHEDULER_ARTIFACT_BUCKET
 
 Notes:
   - Modes are idempotent: missing stacks/tables/instances/files/log groups are
@@ -70,10 +72,11 @@ Notes:
   - CloudWatch log groups for Lambda (/aws/lambda/<FunctionName>) are created
     by the Lambda service, not CloudFormation, so they survive stack deletion
     and are swept here.
-  - The SAM-managed artifact bucket (aws-sam-cli-managed-default stack's
-    SourceBucket) is shared across SAM deploys in the account/region. It is
-    cleaned whenever apiserver or scheduler modes run; sam deploy re-creates
-    it on the next deploy.
+  - Component SAM artifact buckets are deterministic and per component:
+    <prefix>-lambda-apiserver-<account>-<region> and
+    <prefix>-lambda-controllers-<account>-<region>. They are emptied and
+    deleted with their corresponding component unless --keep-artifact-buckets
+    is set.
 EOF
 }
 
@@ -113,14 +116,15 @@ KUBECONFIG_FILE="${KUBECONFIG_FILE:-${OUT_DIR}/lambda-apiserver.kubeconfig}"
 WORKERS_ENV="${WORKERS_ENV:-${OUT_DIR}/workers.env}"
 APISERVER_LOG_PREFIX="${APISERVER_LOG_PREFIX:-${APISERVER_STACK_NAME}-}"
 SCHEDULER_LOG_PREFIX="${SCHEDULER_LOG_PREFIX:-${SCHEDULER_STACK_NAME}-}"
-SAM_MANAGED_STACK_NAME="${SAM_MANAGED_STACK_NAME:-aws-sam-cli-managed-default}"
+APISERVER_ARTIFACT_BUCKET="${APISERVER_ARTIFACT_BUCKET:-}"
+SCHEDULER_ARTIFACT_BUCKET="${SCHEDULER_ARTIFACT_BUCKET:-}"
 
 YES="false"
 KEEP_LOCAL_FILES="false"
 KEEP_DYNAMO="false"
 KEEP_SSM="false"
 KEEP_LOG_GROUPS="false"
-KEEP_SAM_BUCKET="false"
+KEEP_ARTIFACT_BUCKETS="false"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -134,12 +138,17 @@ while [[ $# -gt 0 ]]; do
     --workers-env) WORKERS_ENV="$2"; shift 2 ;;
     --apiserver-log-prefix) APISERVER_LOG_PREFIX="$2"; shift 2 ;;
     --scheduler-log-prefix) SCHEDULER_LOG_PREFIX="$2"; shift 2 ;;
-    --sam-managed-stack) SAM_MANAGED_STACK_NAME="$2"; shift 2 ;;
+    --apiserver-artifact-bucket) APISERVER_ARTIFACT_BUCKET="$2"; shift 2 ;;
+    --scheduler-artifact-bucket) SCHEDULER_ARTIFACT_BUCKET="$2"; shift 2 ;;
+    --sam-managed-stack)
+      echo "[*] Ignoring deprecated --sam-managed-stack; component artifact buckets are used now."
+      shift 2
+      ;;
     --keep-local-files) KEEP_LOCAL_FILES="true"; shift ;;
     --keep-dynamo) KEEP_DYNAMO="true"; shift ;;
     --keep-ssm) KEEP_SSM="true"; shift ;;
     --keep-log-groups) KEEP_LOG_GROUPS="true"; shift ;;
-    --keep-sam-bucket) KEEP_SAM_BUCKET="true"; shift ;;
+    --keep-artifact-buckets|--keep-sam-bucket) KEEP_ARTIFACT_BUCKETS="true"; shift ;;
     -y|--yes) YES="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     *)
@@ -152,6 +161,34 @@ done
 
 need aws
 need jq
+
+default_artifact_bucket_name() {
+  local component="$1"
+  local raw name hash suffix prefix_len prefix
+
+  raw="${SERVERLESS_RESOURCE_PREFIX}-${component}-${AWS_ACCOUNT_ID}-${AWS_REGION}"
+  name="$(
+    printf '%s' "${raw}" \
+      | tr '[:upper:]' '[:lower:]' \
+      | tr -c 'a-z0-9.-' '-' \
+      | sed -E 's/^[.-]+//; s/[.-]+$//; s/[.-]{2,}/-/g'
+  )"
+
+  if [[ ${#name} -gt 63 ]]; then
+    hash="$(printf '%s' "${name}" | cksum | awk '{print $1}')"
+    suffix="-${AWS_ACCOUNT_ID}-${AWS_REGION}-${hash}"
+    prefix_len=$((63 - ${#suffix}))
+    prefix="${name:0:${prefix_len}}"
+    prefix="$(printf '%s' "${prefix}" | sed -E 's/[.-]+$//')"
+    name="${prefix}${suffix}"
+  fi
+
+  printf '%s\n' "${name}"
+}
+
+AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-$(aws sts get-caller-identity --query 'Account' --output text)}"
+APISERVER_ARTIFACT_BUCKET="${APISERVER_ARTIFACT_BUCKET:-$(default_artifact_bucket_name lambda-apiserver)}"
+SCHEDULER_ARTIFACT_BUCKET="${SCHEDULER_ARTIFACT_BUCKET:-$(default_artifact_bucket_name lambda-controllers)}"
 
 confirm() {
   local prompt="$1"
@@ -317,17 +354,17 @@ delete_log_groups_by_prefix() {
   echo "[+] Log groups removed for prefix ${full_prefix}."
 }
 
-######################## SAM-managed bucket helpers ########################
+######################## SAM artifact bucket helpers ########################
 
 empty_s3_bucket() {
   local bucket="$1"
   local versions_json delete_payload object_count
 
   echo "[*] Emptying S3 bucket: s3://${bucket}"
-  aws s3 rm "s3://${bucket}" --recursive >/dev/null 2>&1 || true
+  aws s3 rm "s3://${bucket}" --recursive --region "${AWS_REGION}" >/dev/null 2>&1 || true
 
   while :; do
-    versions_json="$(aws s3api list-object-versions --bucket "${bucket}" --output json 2>/dev/null || echo '{}')"
+    versions_json="$(aws s3api list-object-versions --region "${AWS_REGION}" --bucket "${bucket}" --output json 2>/dev/null || echo '{}')"
     object_count="$(printf '%s' "${versions_json}" | jq '((.Versions // []) + (.DeleteMarkers // [])) | length')"
     if [[ "${object_count}" == "0" ]]; then
       break
@@ -339,38 +376,31 @@ empty_s3_bucket() {
     }')"
 
     aws s3api delete-objects \
+      --region "${AWS_REGION}" \
       --bucket "${bucket}" \
       --delete "${delete_payload}" >/dev/null
   done
 }
 
-cleanup_sam_managed_bucket() {
-  local stack="${SAM_MANAGED_STACK_NAME}"
-  local bucket
+delete_artifact_bucket_if_present() {
+  local bucket="$1"
+  local head_output
 
-  if ! stack_exists "${stack}"; then
-    echo "[*] SAM-managed stack not found: ${stack}"
+  if [[ -z "${bucket}" ]]; then
     return 0
   fi
 
-  bucket="$(
-    aws cloudformation describe-stacks \
-      --region "${AWS_REGION}" \
-      --stack-name "${stack}" \
-      --query "Stacks[0].Outputs[?OutputKey=='SourceBucket'].OutputValue | [0]" \
-      --output text 2>/dev/null || true
-  )"
-
-  if [[ -z "${bucket}" || "${bucket}" == "None" ]]; then
-    echo "[*] SAM-managed stack has no SourceBucket output; deleting stack only."
-  elif aws s3api head-bucket --bucket "${bucket}" >/dev/null 2>&1; then
+  if head_output="$(aws s3api head-bucket --region "${AWS_REGION}" --bucket "${bucket}" 2>&1)"; then
     empty_s3_bucket "${bucket}"
+    aws s3api delete-bucket --region "${AWS_REGION}" --bucket "${bucket}" >/dev/null
+    echo "[+] Deleted SAM artifact bucket: s3://${bucket}"
+  elif printf '%s' "${head_output}" | grep -Eq '\(404\)|Not Found|NoSuchBucket'; then
+    echo "[*] SAM artifact bucket not found: s3://${bucket}"
   else
-    echo "[*] SAM-managed bucket already gone: ${bucket}"
+    echo "Cannot access S3 bucket ${bucket}; leaving it in place."
+    echo "${head_output}"
+    return 1
   fi
-
-  delete_stack_if_present "${stack}"
-  echo "[+] SAM-managed artifact resources cleaned."
 }
 
 ######################## EC2 worker helpers ########################
@@ -481,6 +511,7 @@ teardown_apiserver() {
   echo "  dynamo table prefix: ${APISERVER_DYNAMO_TABLE}"
   echo "  kubeconfig ssm:      ${KUBECONFIG_PARAMETER_NAME}"
   echo "  log group prefix:    /aws/lambda/${APISERVER_LOG_PREFIX}"
+  echo "  artifact bucket:     ${APISERVER_ARTIFACT_BUCKET}"
   echo
 
   delete_stack_if_present "${APISERVER_STACK_NAME}"
@@ -503,10 +534,10 @@ teardown_apiserver() {
     delete_log_groups_by_prefix "${APISERVER_LOG_PREFIX}"
   fi
 
-  if [[ "${KEEP_SAM_BUCKET}" == "true" ]]; then
-    echo "[*] Skipping SAM-managed artifact cleanup (--keep-sam-bucket)"
+  if [[ "${KEEP_ARTIFACT_BUCKETS}" == "true" ]]; then
+    echo "[*] Skipping SAM artifact bucket cleanup (--keep-artifact-buckets)"
   else
-    cleanup_sam_managed_bucket
+    delete_artifact_bucket_if_present "${APISERVER_ARTIFACT_BUCKET}"
   fi
 
   if [[ "${KEEP_LOCAL_FILES}" != "true" ]]; then
@@ -519,6 +550,7 @@ teardown_scheduler() {
   echo "  region:           ${AWS_REGION}"
   echo "  stack:            ${SCHEDULER_STACK_NAME}"
   echo "  log group prefix: /aws/lambda/${SCHEDULER_LOG_PREFIX}"
+  echo "  artifact bucket:  ${SCHEDULER_ARTIFACT_BUCKET}"
   echo
   delete_stack_if_present "${SCHEDULER_STACK_NAME}"
 
@@ -528,10 +560,10 @@ teardown_scheduler() {
     delete_log_groups_by_prefix "${SCHEDULER_LOG_PREFIX}"
   fi
 
-  if [[ "${KEEP_SAM_BUCKET}" == "true" ]]; then
-    echo "[*] Skipping SAM-managed artifact cleanup (--keep-sam-bucket)"
+  if [[ "${KEEP_ARTIFACT_BUCKETS}" == "true" ]]; then
+    echo "[*] Skipping SAM artifact bucket cleanup (--keep-artifact-buckets)"
   else
-    cleanup_sam_managed_bucket
+    delete_artifact_bucket_if_present "${SCHEDULER_ARTIFACT_BUCKET}"
   fi
 }
 
@@ -549,11 +581,11 @@ teardown_workers() {
 
 case "${MODE}" in
   apiserver)
-    confirm "Delete apiserver stack ${APISERVER_STACK_NAME}, its DynamoDB tables (prefix ${APISERVER_DYNAMO_TABLE}), SSM parameter ${KUBECONFIG_PARAMETER_NAME}, /aws/lambda/${APISERVER_LOG_PREFIX}* log groups, and the SAM-managed artifact bucket?"
+    confirm "Delete apiserver stack ${APISERVER_STACK_NAME}, its DynamoDB tables (prefix ${APISERVER_DYNAMO_TABLE}), SSM parameter ${KUBECONFIG_PARAMETER_NAME}, /aws/lambda/${APISERVER_LOG_PREFIX}* log groups, and artifact bucket ${APISERVER_ARTIFACT_BUCKET}?"
     teardown_apiserver
     ;;
   scheduler)
-    confirm "Delete scheduler stack ${SCHEDULER_STACK_NAME}, /aws/lambda/${SCHEDULER_LOG_PREFIX}* log groups, and the SAM-managed artifact bucket?"
+    confirm "Delete scheduler stack ${SCHEDULER_STACK_NAME}, /aws/lambda/${SCHEDULER_LOG_PREFIX}* log groups, and artifact bucket ${SCHEDULER_ARTIFACT_BUCKET}?"
     teardown_scheduler
     ;;
   workers)
@@ -561,7 +593,7 @@ case "${MODE}" in
     teardown_workers
     ;;
   all)
-    confirm "Tear down workers, scheduler stack ${SCHEDULER_STACK_NAME}, apiserver stack ${APISERVER_STACK_NAME} (with DynamoDB tables and SSM kubeconfig), their Lambda log groups, and the SAM-managed artifact bucket?"
+    confirm "Tear down workers, scheduler stack ${SCHEDULER_STACK_NAME}, apiserver stack ${APISERVER_STACK_NAME} (with DynamoDB tables and SSM kubeconfig), their Lambda log groups, and component artifact buckets ${SCHEDULER_ARTIFACT_BUCKET} and ${APISERVER_ARTIFACT_BUCKET}?"
     teardown_workers
     teardown_scheduler
     teardown_apiserver

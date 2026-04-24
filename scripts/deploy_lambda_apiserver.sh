@@ -13,7 +13,7 @@ Options:
   --skip-seed                 Do not seed default Kubernetes namespaces.
   --skip-dynamo               Do not precreate DynamoDB tables.
   --seed-only                 Use an existing apiserver stack and only publish/seed.
-  --seed-synthetic-nodes N    Also create N synthetic Node objects (default: 0).
+  --artifact-bucket NAME      S3 bucket for SAM deployment artifacts.
   -h, --help                  Show help.
 
 Environment knobs:
@@ -23,6 +23,7 @@ Environment knobs:
   APISERVER_RESOURCE_PREFIX   Lambda/API resource prefix
   APISERVER_DYNAMO_TABLE      DynamoDB table prefix
   KUBECONFIG_PARAMETER_NAME   SSM parameter containing the full kubeconfig
+  APISERVER_ARTIFACT_BUCKET   S3 bucket for apiserver SAM artifacts
   OUT_DIR                     Local output directory
 EOF
 }
@@ -35,7 +36,6 @@ need() {
 }
 
 SEED_NAMESPACES=1
-SEED_SYNTHETIC_NODES="${SEED_SYNTHETIC_NODES:-0}"
 PRECREATE_DYNAMO=1
 BUILD_DEPLOY_APISERVER=1
 
@@ -44,7 +44,7 @@ while [[ $# -gt 0 ]]; do
     --skip-seed) SEED_NAMESPACES=0; shift ;;
     --skip-dynamo) PRECREATE_DYNAMO=0; shift ;;
     --seed-only) PRECREATE_DYNAMO=0; BUILD_DEPLOY_APISERVER=0; shift ;;
-    --seed-synthetic-nodes) SEED_SYNTHETIC_NODES="$2"; shift 2 ;;
+    --artifact-bucket) APISERVER_ARTIFACT_BUCKET="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *)
       echo "Unknown argument: $1"
@@ -84,6 +84,175 @@ PRECREATE_DYNAMO_TABLES_SCRIPT="${PRECREATE_DYNAMO_TABLES_SCRIPT:-${SCRIPT_DIR}/
 DYNAMO_INIT_APISERVER_DIR="${DYNAMO_INIT_APISERVER_DIR:-${K8S_DIR}/staging/src/k8s.io/apiserver}"
 SEED_APISERVER_SCRIPT="${SEED_APISERVER_SCRIPT:-${SCRIPT_DIR}/seed_lambda_apiserver_raw.sh}"
 
+default_artifact_bucket_name() {
+  local component="$1"
+  local raw name hash suffix prefix_len prefix
+
+  raw="${SERVERLESS_RESOURCE_PREFIX}-${component}-${AWS_ACCOUNT_ID}-${AWS_REGION}"
+  name="$(
+    printf '%s' "${raw}" \
+      | tr '[:upper:]' '[:lower:]' \
+      | tr -c 'a-z0-9.-' '-' \
+      | sed -E 's/^[.-]+//; s/[.-]+$//; s/[.-]{2,}/-/g'
+  )"
+
+  if [[ ${#name} -gt 63 ]]; then
+    hash="$(printf '%s' "${name}" | cksum | awk '{print $1}')"
+    suffix="-${AWS_ACCOUNT_ID}-${AWS_REGION}-${hash}"
+    prefix_len=$((63 - ${#suffix}))
+    prefix="${name:0:${prefix_len}}"
+    prefix="$(printf '%s' "${prefix}" | sed -E 's/[.-]+$//')"
+    name="${prefix}${suffix}"
+  fi
+
+  printf '%s\n' "${name}"
+}
+
+ensure_artifact_bucket() {
+  local bucket="$1"
+  local head_output
+
+  if head_output="$(aws s3api head-bucket --region "${AWS_REGION}" --bucket "${bucket}" 2>&1)"; then
+    echo "[*] Reusing SAM artifact bucket: s3://${bucket}"
+    return 0
+  fi
+
+  if printf '%s' "${head_output}" | grep -Eq '\(404\)|Not Found|NoSuchBucket'; then
+    echo "[*] Creating SAM artifact bucket: s3://${bucket}"
+    if [[ "${AWS_REGION}" == "us-east-1" ]]; then
+      aws s3api create-bucket \
+        --region "${AWS_REGION}" \
+        --bucket "${bucket}" >/dev/null
+    else
+      aws s3api create-bucket \
+        --region "${AWS_REGION}" \
+        --bucket "${bucket}" \
+        --create-bucket-configuration "LocationConstraint=${AWS_REGION}" >/dev/null
+    fi
+    aws s3api wait bucket-exists --region "${AWS_REGION}" --bucket "${bucket}"
+    aws s3api put-public-access-block \
+      --region "${AWS_REGION}" \
+      --bucket "${bucket}" \
+      --public-access-block-configuration \
+        BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true >/dev/null
+    return 0
+  fi
+
+  echo "Cannot access S3 bucket ${bucket}."
+  echo "${head_output}"
+  echo "Set APISERVER_ARTIFACT_BUCKET to a bucket name you own, or delete/rename the conflicting bucket."
+  exit 1
+}
+
+stack_status() {
+  local stack_name="$1"
+
+  aws cloudformation describe-stacks \
+    --region "${AWS_REGION}" \
+    --stack-name "${stack_name}" \
+    --query 'Stacks[0].StackStatus' \
+    --output text 2>/dev/null || true
+}
+
+find_companion_stacks() {
+  local stack_name="$1"
+  aws cloudformation list-stacks \
+    --region "${AWS_REGION}" \
+    --stack-status-filter \
+      CREATE_IN_PROGRESS CREATE_FAILED CREATE_COMPLETE \
+      ROLLBACK_IN_PROGRESS ROLLBACK_FAILED ROLLBACK_COMPLETE \
+      DELETE_IN_PROGRESS DELETE_FAILED \
+      UPDATE_IN_PROGRESS UPDATE_COMPLETE_CLEANUP_IN_PROGRESS UPDATE_COMPLETE \
+      UPDATE_ROLLBACK_IN_PROGRESS UPDATE_ROLLBACK_FAILED \
+      UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS UPDATE_ROLLBACK_COMPLETE \
+    --query "StackSummaries[?starts_with(StackName, \`${stack_name}-\`) && ends_with(StackName, \`-CompanionStack\`)].StackName" \
+    --output text 2>/dev/null || true
+}
+
+ensure_companion_stacks_deployable() {
+  local stack_name="$1"
+  local companion status
+
+  while IFS= read -r companion; do
+    [[ -z "${companion}" ]] && continue
+    status="$(stack_status "${companion}")"
+    case "${status}" in
+      ROLLBACK_COMPLETE|ROLLBACK_FAILED|CREATE_FAILED|DELETE_FAILED)
+        echo "[!] Companion stack ${companion} is ${status}; deleting before redeploy"
+        aws cloudformation delete-stack \
+          --region "${AWS_REGION}" \
+          --stack-name "${companion}"
+        aws cloudformation wait stack-delete-complete \
+          --region "${AWS_REGION}" \
+          --stack-name "${companion}"
+        ;;
+      DELETE_IN_PROGRESS)
+        echo "[*] Waiting for companion stack delete to complete: ${companion}"
+        aws cloudformation wait stack-delete-complete \
+          --region "${AWS_REGION}" \
+          --stack-name "${companion}"
+        ;;
+    esac
+  done < <(find_companion_stacks "${stack_name}" | tr '\t' '\n')
+}
+
+ensure_deployable_stack() {
+  local stack_name="$1"
+  local status
+
+  ensure_companion_stacks_deployable "${stack_name}"
+
+  status="$(stack_status "${stack_name}")"
+  [[ -z "${status}" || "${status}" == "None" ]] && return 0
+
+  case "${status}" in
+    ROLLBACK_COMPLETE|ROLLBACK_FAILED|CREATE_FAILED|DELETE_FAILED)
+      echo "[!] Stack ${stack_name} is ${status}; deleting failed stack before redeploy"
+      aws cloudformation delete-stack \
+        --region "${AWS_REGION}" \
+        --stack-name "${stack_name}"
+      aws cloudformation wait stack-delete-complete \
+        --region "${AWS_REGION}" \
+        --stack-name "${stack_name}"
+      ;;
+    DELETE_IN_PROGRESS)
+      echo "[*] Waiting for stack delete to complete: ${stack_name}"
+      aws cloudformation wait stack-delete-complete \
+        --region "${AWS_REGION}" \
+        --stack-name "${stack_name}"
+      ;;
+  esac
+}
+
+print_stack_failure_events() {
+  local stack_name="$1"
+  local stack_id
+
+  stack_id="$(
+    aws cloudformation list-stacks \
+      --region "${AWS_REGION}" \
+      --query "StackSummaries[?StackName==\`${stack_name}\`] | sort_by(@, &CreationTime)[-1].StackId" \
+      --output text 2>/dev/null || true
+  )"
+
+  echo
+  echo "[!] Recent CloudFormation failure events for ${stack_name}:"
+  if [[ -z "${stack_id}" || "${stack_id}" == "None" ]]; then
+    echo "    (no stack history found for ${stack_name})"
+    return 0
+  fi
+
+  aws cloudformation describe-stack-events \
+    --region "${AWS_REGION}" \
+    --stack-name "${stack_id}" \
+    --max-items 40 \
+    --query "StackEvents[?contains(ResourceStatus, 'FAILED') || contains(ResourceStatus, 'ROLLBACK')].[Timestamp,LogicalResourceId,ResourceStatus,ResourceStatusReason]" \
+    --output table || true
+}
+
+AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-$(aws sts get-caller-identity --query 'Account' --output text)}"
+APISERVER_ARTIFACT_BUCKET="${APISERVER_ARTIFACT_BUCKET:-$(default_artifact_bucket_name lambda-apiserver)}"
+
 mkdir -p "${OUT_DIR}"
 
 if [[ "${APISERVER_TOKEN}" != "devtoken123" ]]; then
@@ -97,6 +266,7 @@ echo "Stack:               ${APISERVER_STACK_NAME}"
 echo "Resource prefix:     ${APISERVER_RESOURCE_PREFIX}"
 echo "DynamoDB base table: ${APISERVER_DYNAMO_TABLE}"
 echo "Kubeconfig SSM name: ${KUBECONFIG_PARAMETER_NAME}"
+echo "Artifact bucket:     ${APISERVER_ARTIFACT_BUCKET}"
 echo "Out dir:             ${OUT_DIR}"
 echo
 
@@ -106,7 +276,7 @@ fi
 if [[ "${PRECREATE_DYNAMO}" == "1" ]]; then
   [[ -x "${PRECREATE_DYNAMO_TABLES_SCRIPT}" ]] || { echo "Missing executable table precreate script: ${PRECREATE_DYNAMO_TABLES_SCRIPT}"; exit 1; }
 fi
-if [[ "${SEED_NAMESPACES}" == "1" || "${SEED_SYNTHETIC_NODES}" != "0" ]]; then
+if [[ "${SEED_NAMESPACES}" == "1" ]]; then
   [[ -x "${SEED_APISERVER_SCRIPT}" ]] || { echo "Missing executable seed script: ${SEED_APISERVER_SCRIPT}"; exit 1; }
 fi
 
@@ -127,24 +297,30 @@ if [[ "${BUILD_DEPLOY_APISERVER}" == "1" ]]; then
     --build-dir "${OUT_DIR}/.aws-sam-apiserver"
 
   echo "[*] Deploying Lambda apiserver"
-  sam deploy \
-    --template-file "${OUT_DIR}/.aws-sam-apiserver/template.yaml" \
-    --stack-name "${APISERVER_STACK_NAME}" \
-    --region "${AWS_REGION}" \
-    --capabilities CAPABILITY_IAM \
-    --resolve-s3 \
-    --resolve-image-repos \
-    --no-confirm-changeset \
-    --no-fail-on-empty-changeset \
-    --parameter-overrides \
-      ResourcePrefix="${APISERVER_RESOURCE_PREFIX}" \
-      ProjectTagValue="${PROJECT_TAG_VALUE}" \
-      EnvironmentTagValue="${ENVIRONMENT_TAG_VALUE}" \
-      DynamoRegion="${AWS_REGION}" \
-      DynamoTable="${APISERVER_DYNAMO_TABLE}" \
-      ServiceClusterIPRange="${SERVICE_CLUSTER_IP_RANGE}" \
-      ApiServerAdvertiseAddress="${APISERVER_ADVERTISE_ADDRESS}" \
-      ApiServerBindAddress="${APISERVER_BIND_ADDRESS}"
+  ensure_artifact_bucket "${APISERVER_ARTIFACT_BUCKET}"
+  ensure_deployable_stack "${APISERVER_STACK_NAME}"
+  if ! sam deploy \
+      --template-file "${OUT_DIR}/.aws-sam-apiserver/template.yaml" \
+      --stack-name "${APISERVER_STACK_NAME}" \
+      --region "${AWS_REGION}" \
+      --capabilities CAPABILITY_IAM \
+      --s3-bucket "${APISERVER_ARTIFACT_BUCKET}" \
+      --resolve-image-repos \
+      --disable-rollback \
+      --no-confirm-changeset \
+      --no-fail-on-empty-changeset \
+      --parameter-overrides \
+        ResourcePrefix="${APISERVER_RESOURCE_PREFIX}" \
+        ProjectTagValue="${PROJECT_TAG_VALUE}" \
+        EnvironmentTagValue="${ENVIRONMENT_TAG_VALUE}" \
+        DynamoRegion="${AWS_REGION}" \
+        DynamoTable="${APISERVER_DYNAMO_TABLE}" \
+        ServiceClusterIPRange="${SERVICE_CLUSTER_IP_RANGE}" \
+        ApiServerAdvertiseAddress="${APISERVER_ADVERTISE_ADDRESS}" \
+        ApiServerBindAddress="${APISERVER_BIND_ADDRESS}"; then
+    print_stack_failure_events "${APISERVER_STACK_NAME}"
+    exit 1
+  fi
 else
   echo "[*] Skipping Lambda apiserver build/deploy; using existing stack ${APISERVER_STACK_NAME}"
 fi
@@ -209,15 +385,10 @@ aws ssm put-parameter \
   --overwrite \
   --value "$(cat "${local_kubeconfig}")" >/dev/null
 
-if [[ "${SEED_NAMESPACES}" == "1" || "${SEED_SYNTHETIC_NODES}" != "0" ]]; then
-  namespaces=""
-  if [[ "${SEED_NAMESPACES}" == "1" ]]; then
-    namespaces="default,kube-system,kube-public,kube-node-lease"
-  fi
+if [[ "${SEED_NAMESPACES}" == "1" ]]; then
   if ! "${SEED_APISERVER_SCRIPT}" \
     --kubeconfig "${local_kubeconfig}" \
-    --namespaces "${namespaces}" \
-    --synthetic-nodes "${SEED_SYNTHETIC_NODES}"; then
+    --namespaces "default,kube-system,kube-public,kube-node-lease"; then
     tail_apiserver_logs
     exit 1
   fi

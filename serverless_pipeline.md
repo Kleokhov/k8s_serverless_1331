@@ -11,7 +11,7 @@ scripts/
 ├── deploy_lambda_apiserver.sh          # step 1: apiserver stack + Dynamo + SSM + seed
 ├── deploy_lambda_scheduler.sh          # step 2: scheduler/dispatcher/controllers stack
 ├── deploy_serverless_kubelet.sh        # step 3: provision EC2 workers + install kubelet
-├── deploy_serverless_pipeline.sh       # one-shot wrapper for steps 1+2 (+ optional seed)
+├── deploy_serverless_pipeline.sh       # one-shot wrapper for steps 1+2+3
 ├── precreate_dynamo_tables.sh          # helper called by the apiserver deploy
 ├── seed_lambda_apiserver_raw.sh        # helper called by the apiserver deploy
 ├── _ec2_bootstrap/                     # per-node install scripts copied onto workers
@@ -21,6 +21,34 @@ scripts/
     ├── shutdown_serverless.sh          # apiserver | scheduler | workers | all
     └── shutdown_ec2_partial_cluster.sh # older kubeadm cluster teardown
 ```
+
+## One-shot deployment
+
+Use the pipeline wrapper when you want the full path in one command. It deploys
+the Lambda apiserver, publishes the SSM kubeconfig, deploys the Lambda scheduler,
+then creates and bootstraps serverless kubelet workers:
+
+```bash
+AWS_REGION=us-east-1 \
+SERVERLESS_RESOURCE_PREFIX=ctrlless-serverless \
+./scripts/deploy_serverless_pipeline.sh \
+  --identity-file ~/.ssh/your-key.pem
+```
+
+Worker options such as `--workers`, `--instance-type`, `--behavior`, `--host`,
+and `--cluster-env` are passed through to `deploy_serverless_kubelet.sh`.
+
+SAM artifacts are stored in deterministic per-component buckets. By default the
+scripts derive globally unique names from the serverless prefix, AWS account,
+and region:
+
+- apiserver: `${SERVERLESS_RESOURCE_PREFIX}-lambda-apiserver-<account>-<region>`
+- scheduler/controllers: `${SERVERLESS_RESOURCE_PREFIX}-lambda-controllers-<account>-<region>`
+
+Set `APISERVER_ARTIFACT_BUCKET` or `SCHEDULER_ARTIFACT_BUCKET`, or pass
+`--apiserver-artifact-bucket` / `--scheduler-artifact-bucket`, to choose exact
+bucket names. Deploy reuses the bucket when it already exists and creates it
+when missing.
 
 ## 1. Deploy the Lambda apiserver
 
@@ -126,6 +154,47 @@ kubectl --kubeconfig _serverless_out/lambda-apiserver.kubeconfig \
   get --raw /api/v1/namespaces/default/pods
 ```
 
+The serverless schedule test scripts default to
+`_serverless_out/lambda-apiserver.kubeconfig`, so you can run them directly from
+the repo root after the pipeline finishes. Set `KUBECONFIG` if you want to point
+them at a different kubeconfig.
+
+Start with a small direct-Pod smoke test:
+
+```bash
+POD_COUNT=6 \
+POD_RUN_SECONDS=30 \
+WAIT_TIMEOUT=120s \
+./scripts/test/test_schedule_pods.sh
+```
+
+Then test the Job controller path:
+
+```bash
+COMPLETIONS=6 \
+PARALLELISM=6 \
+POD_RUN_SECONDS=10 \
+WAIT_TIMEOUT=180s \
+./scripts/test/test_schedule.sh
+```
+
+For a longer scheduler/controller load run, use the minutely top-up test. This
+example is intentionally smaller than the default one-hour saturation run:
+
+```bash
+TEST_DURATION_SECONDS=300 \
+TARGET_PENDING_PODS=25 \
+TARGET_INFLIGHT_PODS=50 \
+MAX_JOBS_PER_INTERVAL=10 \
+CLEANUP=true \
+./scripts/test/test_schedule_minutely.sh
+```
+
+Successful scheduling runs should show pods leaving `Pending`, getting a worker
+node in the `NODE` column, and printing their container logs. The
+`test_schedule_serverful.sh` wrapper is for the older kubeadm/serverful control
+plane profiling flow and is not used for the Lambda control plane.
+
 Expected MVP limits: no watch support, no kube-controller-manager, no kube-proxy,
 no CoreDNS unless you add those pieces separately, and no guarantee that kubectl
 commands requiring discovery work yet. This is enough for typed clients and raw
@@ -136,8 +205,8 @@ kubelets to poll the Lambda apiserver for assigned pods.
 
 Use `scripts/shutdown/shutdown_serverless.sh`. Modes are idempotent and each
 mode cleans up its CloudFormation stack, any associated DynamoDB tables created
-outside CloudFormation, CloudWatch `/aws/lambda/<fn>` log groups, the shared
-SAM-managed artifact bucket, and local state files under `_serverless_out/`.
+outside CloudFormation, CloudWatch `/aws/lambda/<fn>` log groups, the matching
+component SAM artifact bucket, and local state files under `_serverless_out/`.
 
 ```bash
 # Nuke everything (workers -> scheduler -> apiserver, safe order):
@@ -153,4 +222,5 @@ Shared VPC/subnet/security-group/IAM-role resources are intentionally NOT
 deleted; they are reused across deploys and managed by
 `scripts/ec2_k8s/setup_ec2.sh`. Run `./scripts/shutdown/shutdown_serverless.sh --help`
 for the full option set (`--keep-dynamo`, `--keep-ssm`, `--keep-log-groups`,
-`--keep-sam-bucket`, `--keep-local-files`, custom stack/prefix overrides, etc.).
+`--keep-artifact-buckets`, `--keep-local-files`, custom stack/prefix overrides,
+etc.).

@@ -11,6 +11,8 @@ existing Lambda apiserver kubeconfig stored in SSM.
 Options:
   --no-kick       Do not enqueue the initial dispatcher self-trigger.
   --skip-build    Reuse the existing SAM build directory and only deploy.
+  --artifact-bucket NAME
+                  S3 bucket for SAM deployment artifacts.
   -h, --help      Show help.
 
 Environment knobs:
@@ -20,6 +22,7 @@ Environment knobs:
   SCHEDULER_RESOURCE_PREFIX   Scheduler Lambda/SQS/Dynamo resource prefix
   KUBECONFIG_PARAMETER_NAME   SSM parameter containing the full kubeconfig
   SCHEDULER_ATTACH_TO_VPC     true|false, default false
+  SCHEDULER_ARTIFACT_BUCKET   S3 bucket for scheduler/controller SAM artifacts
 EOF
 }
 
@@ -37,6 +40,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-kick) KICK_DISPATCHER=0; shift ;;
     --skip-build) SKIP_BUILD=1; shift ;;
+    --artifact-bucket) SCHEDULER_ARTIFACT_BUCKET="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *)
       echo "Unknown argument: $1"
@@ -70,6 +74,175 @@ CLUSTER_SUBNET_IDS="${CLUSTER_SUBNET_IDS:-}"
 CLUSTER_SECURITY_GROUP_ID="${CLUSTER_SECURITY_GROUP_ID:-}"
 CLUSTER_ROUTE_TABLE_IDS="${CLUSTER_ROUTE_TABLE_IDS:-}"
 
+default_artifact_bucket_name() {
+  local component="$1"
+  local raw name hash suffix prefix_len prefix
+
+  raw="${SERVERLESS_RESOURCE_PREFIX}-${component}-${AWS_ACCOUNT_ID}-${AWS_REGION}"
+  name="$(
+    printf '%s' "${raw}" \
+      | tr '[:upper:]' '[:lower:]' \
+      | tr -c 'a-z0-9.-' '-' \
+      | sed -E 's/^[.-]+//; s/[.-]+$//; s/[.-]{2,}/-/g'
+  )"
+
+  if [[ ${#name} -gt 63 ]]; then
+    hash="$(printf '%s' "${name}" | cksum | awk '{print $1}')"
+    suffix="-${AWS_ACCOUNT_ID}-${AWS_REGION}-${hash}"
+    prefix_len=$((63 - ${#suffix}))
+    prefix="${name:0:${prefix_len}}"
+    prefix="$(printf '%s' "${prefix}" | sed -E 's/[.-]+$//')"
+    name="${prefix}${suffix}"
+  fi
+
+  printf '%s\n' "${name}"
+}
+
+ensure_artifact_bucket() {
+  local bucket="$1"
+  local head_output
+
+  if head_output="$(aws s3api head-bucket --region "${AWS_REGION}" --bucket "${bucket}" 2>&1)"; then
+    echo "[*] Reusing SAM artifact bucket: s3://${bucket}"
+    return 0
+  fi
+
+  if printf '%s' "${head_output}" | grep -Eq '\(404\)|Not Found|NoSuchBucket'; then
+    echo "[*] Creating SAM artifact bucket: s3://${bucket}"
+    if [[ "${AWS_REGION}" == "us-east-1" ]]; then
+      aws s3api create-bucket \
+        --region "${AWS_REGION}" \
+        --bucket "${bucket}" >/dev/null
+    else
+      aws s3api create-bucket \
+        --region "${AWS_REGION}" \
+        --bucket "${bucket}" \
+        --create-bucket-configuration "LocationConstraint=${AWS_REGION}" >/dev/null
+    fi
+    aws s3api wait bucket-exists --region "${AWS_REGION}" --bucket "${bucket}"
+    aws s3api put-public-access-block \
+      --region "${AWS_REGION}" \
+      --bucket "${bucket}" \
+      --public-access-block-configuration \
+        BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true >/dev/null
+    return 0
+  fi
+
+  echo "Cannot access S3 bucket ${bucket}."
+  echo "${head_output}"
+  echo "Set SCHEDULER_ARTIFACT_BUCKET to a bucket name you own, or delete/rename the conflicting bucket."
+  exit 1
+}
+
+stack_status() {
+  local stack_name="$1"
+
+  aws cloudformation describe-stacks \
+    --region "${AWS_REGION}" \
+    --stack-name "${stack_name}" \
+    --query 'Stacks[0].StackStatus' \
+    --output text 2>/dev/null || true
+}
+
+find_companion_stacks() {
+  local stack_name="$1"
+  aws cloudformation list-stacks \
+    --region "${AWS_REGION}" \
+    --stack-status-filter \
+      CREATE_IN_PROGRESS CREATE_FAILED CREATE_COMPLETE \
+      ROLLBACK_IN_PROGRESS ROLLBACK_FAILED ROLLBACK_COMPLETE \
+      DELETE_IN_PROGRESS DELETE_FAILED \
+      UPDATE_IN_PROGRESS UPDATE_COMPLETE_CLEANUP_IN_PROGRESS UPDATE_COMPLETE \
+      UPDATE_ROLLBACK_IN_PROGRESS UPDATE_ROLLBACK_FAILED \
+      UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS UPDATE_ROLLBACK_COMPLETE \
+    --query "StackSummaries[?starts_with(StackName, \`${stack_name}-\`) && ends_with(StackName, \`-CompanionStack\`)].StackName" \
+    --output text 2>/dev/null || true
+}
+
+ensure_companion_stacks_deployable() {
+  local stack_name="$1"
+  local companion status
+
+  while IFS= read -r companion; do
+    [[ -z "${companion}" ]] && continue
+    status="$(stack_status "${companion}")"
+    case "${status}" in
+      ROLLBACK_COMPLETE|ROLLBACK_FAILED|CREATE_FAILED|DELETE_FAILED)
+        echo "[!] Companion stack ${companion} is ${status}; deleting before redeploy"
+        aws cloudformation delete-stack \
+          --region "${AWS_REGION}" \
+          --stack-name "${companion}"
+        aws cloudformation wait stack-delete-complete \
+          --region "${AWS_REGION}" \
+          --stack-name "${companion}"
+        ;;
+      DELETE_IN_PROGRESS)
+        echo "[*] Waiting for companion stack delete to complete: ${companion}"
+        aws cloudformation wait stack-delete-complete \
+          --region "${AWS_REGION}" \
+          --stack-name "${companion}"
+        ;;
+    esac
+  done < <(find_companion_stacks "${stack_name}" | tr '\t' '\n')
+}
+
+ensure_deployable_stack() {
+  local stack_name="$1"
+  local status
+
+  ensure_companion_stacks_deployable "${stack_name}"
+
+  status="$(stack_status "${stack_name}")"
+  [[ -z "${status}" || "${status}" == "None" ]] && return 0
+
+  case "${status}" in
+    ROLLBACK_COMPLETE|ROLLBACK_FAILED|CREATE_FAILED|DELETE_FAILED)
+      echo "[!] Stack ${stack_name} is ${status}; deleting failed stack before redeploy"
+      aws cloudformation delete-stack \
+        --region "${AWS_REGION}" \
+        --stack-name "${stack_name}"
+      aws cloudformation wait stack-delete-complete \
+        --region "${AWS_REGION}" \
+        --stack-name "${stack_name}"
+      ;;
+    DELETE_IN_PROGRESS)
+      echo "[*] Waiting for stack delete to complete: ${stack_name}"
+      aws cloudformation wait stack-delete-complete \
+        --region "${AWS_REGION}" \
+        --stack-name "${stack_name}"
+      ;;
+  esac
+}
+
+print_stack_failure_events() {
+  local stack_name="$1"
+  local stack_id
+
+  stack_id="$(
+    aws cloudformation list-stacks \
+      --region "${AWS_REGION}" \
+      --query "StackSummaries[?StackName==\`${stack_name}\`] | sort_by(@, &CreationTime)[-1].StackId" \
+      --output text 2>/dev/null || true
+  )"
+
+  echo
+  echo "[!] Recent CloudFormation failure events for ${stack_name}:"
+  if [[ -z "${stack_id}" || "${stack_id}" == "None" ]]; then
+    echo "    (no stack history found for ${stack_name})"
+    return 0
+  fi
+
+  aws cloudformation describe-stack-events \
+    --region "${AWS_REGION}" \
+    --stack-name "${stack_id}" \
+    --max-items 40 \
+    --query "StackEvents[?contains(ResourceStatus, 'FAILED') || contains(ResourceStatus, 'ROLLBACK')].[Timestamp,LogicalResourceId,ResourceStatus,ResourceStatusReason]" \
+    --output table || true
+}
+
+AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-$(aws sts get-caller-identity --query 'Account' --output text)}"
+SCHEDULER_ARTIFACT_BUCKET="${SCHEDULER_ARTIFACT_BUCKET:-$(default_artifact_bucket_name lambda-controllers)}"
+
 mkdir -p "${OUT_DIR}"
 
 echo "== lambda scheduler/dispatcher/controllers =="
@@ -78,6 +251,7 @@ echo "Stack:               ${SCHEDULER_STACK_NAME}"
 echo "Resource prefix:     ${SCHEDULER_RESOURCE_PREFIX}"
 echo "Kubeconfig SSM name: ${KUBECONFIG_PARAMETER_NAME}"
 echo "Attach to VPC:       ${SCHEDULER_ATTACH_TO_VPC}"
+echo "Artifact bucket:     ${SCHEDULER_ARTIFACT_BUCKET}"
 echo "Skip build:          ${SKIP_BUILD}"
 echo "Out dir:             ${OUT_DIR}"
 echo
@@ -110,6 +284,8 @@ else
 fi
 
 echo "[*] Deploying Lambda scheduler/dispatcher/controller stack"
+ensure_artifact_bucket "${SCHEDULER_ARTIFACT_BUCKET}"
+ensure_deployable_stack "${SCHEDULER_STACK_NAME}"
 param_overrides=(
   "ResourcePrefix=${SCHEDULER_RESOURCE_PREFIX}"
   "ProjectTagValue=${PROJECT_TAG_VALUE}"
@@ -127,15 +303,19 @@ if [[ "${SCHEDULER_ATTACH_TO_VPC}" == "true" ]]; then
   )
 fi
 
-sam deploy \
-  --template-file "${built_template}" \
-  --stack-name "${SCHEDULER_STACK_NAME}" \
-  --region "${AWS_REGION}" \
-  --capabilities CAPABILITY_IAM \
-  --resolve-s3 \
-  --no-confirm-changeset \
-  --no-fail-on-empty-changeset \
-  --parameter-overrides "${param_overrides[@]}"
+if ! sam deploy \
+    --template-file "${built_template}" \
+    --stack-name "${SCHEDULER_STACK_NAME}" \
+    --region "${AWS_REGION}" \
+    --capabilities CAPABILITY_IAM \
+    --s3-bucket "${SCHEDULER_ARTIFACT_BUCKET}" \
+    --disable-rollback \
+    --no-confirm-changeset \
+    --no-fail-on-empty-changeset \
+    --parameter-overrides "${param_overrides[@]}"; then
+  print_stack_failure_events "${SCHEDULER_STACK_NAME}"
+  exit 1
+fi
 
 if [[ "${KICK_DISPATCHER}" == "1" ]]; then
   dispatcher_queue_url="$(
