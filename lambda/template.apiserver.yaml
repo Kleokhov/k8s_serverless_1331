@@ -1,0 +1,120 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Lambda-backed Kubernetes apiserver using DynamoDB storage.
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: ctrlless-apiserver
+    Description: Prefix used for the Lambda function and API Gateway.
+  ProjectTagValue:
+    Type: String
+    Default: masters-thesis-lambda-ctrl
+    Description: Cost allocation tag value.
+  EnvironmentTagValue:
+    Type: String
+    Default: thesis
+    Description: Environment tag value.
+  DynamoRegion:
+    Type: String
+    Default: us-east-1
+    Description: AWS region containing the apiserver DynamoDB tables.
+  DynamoTable:
+    Type: String
+    Default: ctrlless-apiserver
+    Description: Base DynamoDB table prefix used by the apiserver storage factory.
+  ServiceClusterIPRange:
+    Type: String
+    Default: 10.96.0.0/12
+    Description: Service ClusterIP CIDR used by the handler-only apiserver.
+  ApiServerAdvertiseAddress:
+    Type: String
+    Default: 127.0.0.1
+    Description: Fixed advertise address for Lambda, avoiding route autodetection.
+  ApiServerBindAddress:
+    Type: String
+    Default: 127.0.0.1
+    Description: Fixed bind address for Lambda, avoiding route autodetection.
+
+Globals:
+  Function:
+    Timeout: 29
+    MemorySize: 1536
+    Architectures:
+      - x86_64
+    PropagateTags: true
+    Tags:
+      Project: !Ref ProjectTagValue
+      Environment: !Ref EnvironmentTagValue
+      Stack: !Ref ResourcePrefix
+      ManagedBy: sam
+
+Resources:
+  LambdaApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      BinaryMediaTypes:
+        - "*/*"
+      Tags:
+        Project: !Ref ProjectTagValue
+        Environment: !Ref EnvironmentTagValue
+        Stack: !Ref ResourcePrefix
+
+  ApiServerFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      DockerContext: ..
+      Dockerfile: lambda/cmd/apiserver/Dockerfile
+      DockerTag: lambda-apiserver
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-lambda-apiserver"
+      PackageType: Image
+      Environment:
+        Variables:
+          DYNAMO_REGION: !Ref DynamoRegion
+          DYNAMO_TABLE: !Ref DynamoTable
+          SERVICE_CLUSTER_IP_RANGE: !Ref ServiceClusterIPRange
+          APISERVER_ADVERTISE_ADDRESS: !Ref ApiServerAdvertiseAddress
+          APISERVER_BIND_ADDRESS: !Ref ApiServerBindAddress
+      Events:
+        Root:
+          Type: Api
+          Properties:
+            RestApiId: !Ref LambdaApi
+            Path: /
+            Method: ANY
+        Proxy:
+          Type: Api
+          Properties:
+            RestApiId: !Ref LambdaApi
+            Path: /{proxy+}
+            Method: ANY
+      Policies:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - Statement:
+            - Sid: ApiServerDynamoStorageAccess
+              Effect: Allow
+              Action:
+                - dynamodb:BatchGetItem
+                - dynamodb:BatchWriteItem
+                - dynamodb:DeleteItem
+                - dynamodb:DescribeTable
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:Query
+                - dynamodb:Scan
+                - dynamodb:TransactGetItems
+                - dynamodb:TransactWriteItems
+                - dynamodb:UpdateItem
+              Resource:
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DynamoTable}"
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DynamoTable}-*"
+
+Outputs:
+  ApiServerFunctionName:
+    Value: !Ref ApiServerFunction
+  ApiServerUrl:
+    Value: !Sub "https://${LambdaApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/Prod"
+  DynamoTableBase:
+    Value: !Ref DynamoTable

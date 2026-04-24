@@ -1,0 +1,10 @@
+.git
+**/.git
+**/.aws-sam
+**/_output
+**/bin
+_ec2_out
+_serverless_out
+_ssh_mux
+tmp
+**/*.log

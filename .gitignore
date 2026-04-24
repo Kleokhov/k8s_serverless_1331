@@ -3,3 +3,12 @@
 
 # Ignore all .txt files
 *.txt
+.codex
+*.md
+
+/_*
+**/_output
+/scripts/_*
+/.idea
+
+/lambda/.aws-sam

@@ -20,7 +20,7 @@ echo "    apiserver dir: $APISERVER_DIR"
 echo "    region:        $DYNAMO_REGION"
 echo "    table base:    $DYNAMO_TABLE"
 
-GOFLAGS="-buildvcs=false -mod=mod" \
+GOFLAGS="-buildvcs=false" \
   go run ./tools/init-dynamo-tables \
     --region "$DYNAMO_REGION" \
     --table "$DYNAMO_TABLE"

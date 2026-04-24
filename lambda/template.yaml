@@ -1,0 +1,819 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Lambda scheduler + controller stack for the masters_thesis EC2 cluster workflow.
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: ctrlless-lambda
+    Description: Prefix used for Lambda, DynamoDB, and SQS resource names.
+  ProjectTagValue:
+    Type: String
+    Default: masters-thesis-lambda-ctrl
+    Description: Cost allocation tag value used to isolate this deployment in Cost Explorer.
+  EnvironmentTagValue:
+    Type: String
+    Default: thesis
+    Description: Environment tag value used for filtering in Cost Explorer and CloudWatch.
+  AttachToVpc:
+    Type: String
+    AllowedValues:
+      - "true"
+      - "false"
+    Default: "true"
+    Description: Attach Lambda functions to the supplied VPC. Use false for the fully serverless apiserver path.
+  ClusterVpcId:
+    Type: String
+    Default: ""
+    Description: VPC created by scripts/setup_ec2.sh.
+  ClusterSubnetIds:
+    Type: String
+    Default: ""
+    Description: Comma-separated subnet IDs where the EC2 control plane and workers run.
+  ClusterSecurityGroupId:
+    Type: String
+    Default: ""
+    Description: Security group attached to the EC2 cluster instances.
+  ClusterRouteTableIds:
+    Type: String
+    Default: ""
+    Description: Comma-separated route table IDs associated with the cluster subnets.
+  KubeconfigParameterPrefix:
+    Type: String
+    Default: ""
+    Description: SSM parameter prefix containing server/cert/key fields for the EC2 cluster path. Defaults to /${ResourcePrefix}/admin-private-kubeconfig when left empty.
+  KubeconfigParameterName:
+    Type: String
+    Default: ""
+    Description: SSM parameter name containing a full kubeconfig. Takes precedence over KubeconfigParameterPrefix.
+  CreateVpcEndpoints:
+    Type: String
+    AllowedValues:
+      - "true"
+      - "false"
+    Default: "false"
+    Description: Create the AWS service VPC endpoints needed by Lambda inside the cluster VPC. Leave false when using scripts/setup_ec2.sh, which now provisions them ahead of deploy.
+  # Dispatcher self-chain
+  DispatcherSelfTriggerInterval:
+    Type: String
+    Default: 30s
+    Description: Target period between dispatcher invocations via SQS self-chain.
+  # Scheduler
+  PodInitialBackoff:
+    Type: String
+    Default: 1s
+  PodMaxBackoff:
+    Type: String
+    Default: 10s
+  PodMaxUnschedulableAge:
+    Type: String
+    Default: 5m
+  # PodGC
+  PodGcTerminatedThreshold:
+    Type: Number
+    Default: 0
+  PodGcRunOnceIterations:
+    Type: Number
+    Default: 3
+
+Conditions:
+  ShouldCreateVpcEndpoints: !Equals [!Ref CreateVpcEndpoints, "true"]
+  ShouldAttachToVpc: !Equals [!Ref AttachToVpc, "true"]
+  HasKubeconfigParameterPrefix: !Not [!Equals [!Ref KubeconfigParameterPrefix, ""]]
+
+Globals:
+  Function:
+    Runtime: provided.al2023
+    Handler: bootstrap
+    CodeUri: ..
+    Architectures:
+      - x86_64
+    MemorySize: 512
+    Timeout: 30
+    PropagateTags: true
+    Tags:
+      Project: !Ref ProjectTagValue
+      Environment: !Ref EnvironmentTagValue
+      Stack: !Ref ResourcePrefix
+      ManagedBy: sam
+    VpcConfig: !If
+      - ShouldAttachToVpc
+      - SecurityGroupIds:
+          - !Ref ClusterSecurityGroupId
+        SubnetIds: !Split [",", !Ref ClusterSubnetIds]
+      - !Ref AWS::NoValue
+    Environment:
+      Variables:
+        ACTIVE_QUEUE_TABLE: !Ref ActiveQueueTable
+        BACKOFF_QUEUE_TABLE: !Ref BackoffQueueTable
+        CACHE_MAP_TABLE: !Ref CacheMapTable
+        KUBECONFIG_PARAMETER_NAME: !Ref KubeconfigParameterName
+        KUBECONFIG_PARAMETER_PREFIX: !If
+          - HasKubeconfigParameterPrefix
+          - !Ref KubeconfigParameterPrefix
+          - !Sub "/${ResourcePrefix}/admin-private-kubeconfig"
+        MISC_MAP_TABLE: !Ref MiscMapTable
+        POD_INITIAL_BACKOFF: !Ref PodInitialBackoff
+        POD_MAX_BACKOFF: !Ref PodMaxBackoff
+        POD_MAX_UNSCHEDULABLE_AGE: !Ref PodMaxUnschedulableAge
+
+Resources:
+  ################### DynamoDB Tables ###################
+  CacheMapTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ResourcePrefix}-cache-map"
+      BillingMode: PAY_PER_REQUEST
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTagValue
+        - Key: Environment
+          Value: !Ref EnvironmentTagValue
+        - Key: Stack
+          Value: !Ref ResourcePrefix
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+
+  MiscMapTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ResourcePrefix}-misc-map"
+      BillingMode: PAY_PER_REQUEST
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTagValue
+        - Key: Environment
+          Value: !Ref EnvironmentTagValue
+        - Key: Stack
+          Value: !Ref ResourcePrefix
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+
+  ActiveQueueTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ResourcePrefix}-active-q"
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: KEYS_ONLY
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTagValue
+        - Key: Environment
+          Value: !Ref EnvironmentTagValue
+        - Key: Stack
+          Value: !Ref ResourcePrefix
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: OrderKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: OrderIndex
+          KeySchema:
+            - AttributeName: PK
+              KeyType: HASH
+            - AttributeName: OrderKey
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  BackoffQueueTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ResourcePrefix}-backoff-q"
+      BillingMode: PAY_PER_REQUEST
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTagValue
+        - Key: Environment
+          Value: !Ref EnvironmentTagValue
+        - Key: Stack
+          Value: !Ref ResourcePrefix
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: OrderKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: OrderIndex
+          KeySchema:
+            - AttributeName: PK
+              KeyType: HASH
+            - AttributeName: OrderKey
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  ################### SQS Queues ###################
+  DispatcherSelfTriggerQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ResourcePrefix}-dispatcher-self-trigger"
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 120
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTagValue
+        - Key: Environment
+          Value: !Ref EnvironmentTagValue
+        - Key: Stack
+          Value: !Ref ResourcePrefix
+
+  JobQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ResourcePrefix}-job.fifo"
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      VisibilityTimeout: 180
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTagValue
+        - Key: Environment
+          Value: !Ref EnvironmentTagValue
+        - Key: Stack
+          Value: !Ref ResourcePrefix
+
+  JobOrphanQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ResourcePrefix}-job-orphan.fifo"
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      VisibilityTimeout: 180
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTagValue
+        - Key: Environment
+          Value: !Ref EnvironmentTagValue
+        - Key: Stack
+          Value: !Ref ResourcePrefix
+
+  TtlAfterFinishedQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ResourcePrefix}-ttl-after-finished.fifo"
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      VisibilityTimeout: 180
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTagValue
+        - Key: Environment
+          Value: !Ref EnvironmentTagValue
+        - Key: Stack
+          Value: !Ref ResourcePrefix
+
+  NamespaceQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ResourcePrefix}-namespace.fifo"
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      VisibilityTimeout: 180
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTagValue
+        - Key: Environment
+          Value: !Ref EnvironmentTagValue
+        - Key: Stack
+          Value: !Ref ResourcePrefix
+
+  ################### Lambda Functions ###################
+  DispatcherFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-dispatcher"
+      Tags:
+        LambdaCostGroup: dispatcher
+      ReservedConcurrentExecutions: 1
+      RecursiveLoop: Allow
+      Events:
+        # EveryMinute:
+        #   Type: Schedule
+        #   Properties:
+        #     Schedule: rate(1 minute)
+        #     Enabled: true
+        SelfTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt DispatcherSelfTriggerQueue.Arn
+            BatchSize: 1
+            Enabled: true
+      Environment:
+        Variables:
+          JOB_QUEUE_URL: !Ref JobQueue
+          JOB_ORPHAN_QUEUE_URL: !Ref JobOrphanQueue
+          TTL_AFTER_FINISHED_QUEUE_URL: !Ref TtlAfterFinishedQueue
+          NAMESPACE_QUEUE_URL: !Ref NamespaceQueue
+          SELF_TRIGGER_QUEUE_URL: !Ref DispatcherSelfTriggerQueue
+          SELF_TRIGGER_INTERVAL: !Ref DispatcherSelfTriggerInterval
+      Policies:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - Statement:
+            - Sid: ReadKubeconfigParameters
+              Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:GetParameters
+              Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*"
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CacheMapTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MiscMapTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ActiveQueueTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BackoffQueueTable
+        - Statement:
+            - Sid: DispatcherControllerQueueSend
+              Effect: Allow
+              Action:
+                - sqs:SendMessage
+              Resource:
+                - !GetAtt JobQueue.Arn
+                - !GetAtt JobOrphanQueue.Arn
+                - !GetAtt TtlAfterFinishedQueue.Arn
+                - !GetAtt NamespaceQueue.Arn
+        - Statement:
+            - Sid: DispatcherSelfTriggerQueueAccess
+              Effect: Allow
+              Action:
+                - sqs:SendMessage
+                - sqs:ReceiveMessage
+                - sqs:DeleteMessage
+                - sqs:GetQueueAttributes
+              Resource: !GetAtt DispatcherSelfTriggerQueue.Arn
+
+  ScheduleOneFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-schedule-one"
+      Tags:
+        LambdaCostGroup: scheduler
+      ReservedConcurrentExecutions: 1
+      Events:
+        ActiveQueueStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt ActiveQueueTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 1
+            Enabled: true
+            FilterCriteria:
+              Filters:
+                - Pattern: '{"eventName":["INSERT","MODIFY"]}'
+      Environment:
+        Variables:
+          BINDER_FUNCTION_NAME: !Ref BinderFunction
+      Policies:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - Statement:
+            - Sid: ReadKubeconfigParameters
+              Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:GetParameters
+              Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*"
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CacheMapTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MiscMapTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ActiveQueueTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BackoffQueueTable
+        - Statement:
+            - Sid: InvokeBinderLambda
+              Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource:
+                - !GetAtt BinderFunction.Arn
+                - !Sub "${BinderFunction.Arn}:*"
+
+  BinderFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-binder"
+      Tags:
+        LambdaCostGroup: scheduler
+      Policies:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - Statement:
+            - Sid: ReadKubeconfigParameters
+              Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:GetParameters
+              Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*"
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CacheMapTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MiscMapTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ActiveQueueTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BackoffQueueTable
+
+  BackoffFlushFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-backoff-flush"
+      Tags:
+        LambdaCostGroup: scheduler
+      Events:
+        EveryMinute:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+            Enabled: true
+      Policies:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ActiveQueueTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BackoffQueueTable
+
+  UnschedulableFlushFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-unschedulable-flush"
+      Tags:
+        LambdaCostGroup: scheduler
+      Events:
+        EveryMinute:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+            Enabled: true
+      Policies:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MiscMapTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ActiveQueueTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BackoffQueueTable
+
+  PodGcFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-podgc"
+      Tags:
+        LambdaCostGroup: scheduler
+      Timeout: 120
+      Events:
+        EveryMinute:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+            Enabled: true
+      Environment:
+        Variables:
+          PODGC_TERMINATED_THRESHOLD: !Ref PodGcTerminatedThreshold
+          PODGC_RUN_ONCE_ITERATIONS: !Ref PodGcRunOnceIterations
+      Policies:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - Statement:
+            - Sid: ReadKubeconfigParameters
+              Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:GetParameters
+              Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*"
+
+  JobControllerFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-job-controller"
+      Tags:
+        LambdaCostGroup: controller
+      Timeout: 120
+      Events:
+        JobQueueTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt JobQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+            Enabled: true
+        JobOrphanQueueTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt JobOrphanQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+            Enabled: true
+      Environment:
+        Variables:
+          JOB_QUEUE_URL: !Ref JobQueue
+          JOB_ORPHAN_QUEUE_URL: !Ref JobOrphanQueue
+          JOB_QUEUE_ARN: !GetAtt JobQueue.Arn
+      Policies:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - Statement:
+            - Sid: ReadKubeconfigParameters
+              Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:GetParameters
+              Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*"
+        - Statement:
+            - Sid: JobControllerQueueAccess
+              Effect: Allow
+              Action:
+                - sqs:ChangeMessageVisibility
+                - sqs:DeleteMessage
+                - sqs:GetQueueAttributes
+                - sqs:GetQueueUrl
+                - sqs:ReceiveMessage
+                - sqs:SendMessage
+              Resource:
+                - !GetAtt JobQueue.Arn
+                - !GetAtt JobOrphanQueue.Arn
+
+  TtlAfterFinishedFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-ttl-after-finished"
+      Tags:
+        LambdaCostGroup: controller
+      Timeout: 120
+      Events:
+        TtlQueueTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt TtlAfterFinishedQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+            Enabled: true
+      Environment:
+        Variables:
+          TTL_AFTER_FINISHED_QUEUE_URL: !Ref TtlAfterFinishedQueue
+      Policies:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - Statement:
+            - Sid: ReadKubeconfigParameters
+              Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:GetParameters
+              Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*"
+        - Statement:
+            - Sid: TtlAfterFinishedQueueAccess
+              Effect: Allow
+              Action:
+                - sqs:ChangeMessageVisibility
+                - sqs:DeleteMessage
+                - sqs:GetQueueAttributes
+                - sqs:GetQueueUrl
+                - sqs:ReceiveMessage
+                - sqs:SendMessage
+              Resource: !GetAtt TtlAfterFinishedQueue.Arn
+
+  NamespaceControllerFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-namespace-controller"
+      Tags:
+        LambdaCostGroup: controller
+      Timeout: 120
+      Events:
+        NamespaceQueueTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt NamespaceQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+            Enabled: true
+      Environment:
+        Variables:
+          NAMESPACE_QUEUE_URL: !Ref NamespaceQueue
+      Policies:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - Statement:
+            - Sid: ReadKubeconfigParameters
+              Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:GetParameters
+              Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*"
+        - Statement:
+            - Sid: NamespaceControllerQueueAccess
+              Effect: Allow
+              Action:
+                - sqs:ChangeMessageVisibility
+                - sqs:DeleteMessage
+                - sqs:GetQueueAttributes
+                - sqs:GetQueueUrl
+                - sqs:ReceiveMessage
+                - sqs:SendMessage
+              Resource: !GetAtt NamespaceQueue.Arn
+
+  ################### VPC Endpoints ###################
+  DynamoDbVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      VpcEndpointType: Gateway
+      VpcId: !Ref ClusterVpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.dynamodb"
+      RouteTableIds: !Split [",", !Ref ClusterRouteTableIds]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTagValue
+        - Key: Environment
+          Value: !Ref EnvironmentTagValue
+        - Key: Stack
+          Value: !Ref ResourcePrefix
+
+  SqsVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      VpcEndpointType: Interface
+      VpcId: !Ref ClusterVpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.sqs"
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref ClusterSecurityGroupId
+      SubnetIds: !Split [",", !Ref ClusterSubnetIds]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTagValue
+        - Key: Environment
+          Value: !Ref EnvironmentTagValue
+        - Key: Stack
+          Value: !Ref ResourcePrefix
+
+  LambdaVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      VpcEndpointType: Interface
+      VpcId: !Ref ClusterVpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.lambda"
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref ClusterSecurityGroupId
+      SubnetIds: !Split [",", !Ref ClusterSubnetIds]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTagValue
+        - Key: Environment
+          Value: !Ref EnvironmentTagValue
+        - Key: Stack
+          Value: !Ref ResourcePrefix
+
+  ExecuteApiVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      VpcEndpointType: Interface
+      VpcId: !Ref ClusterVpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.execute-api"
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref ClusterSecurityGroupId
+      SubnetIds: !Split [",", !Ref ClusterSubnetIds]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTagValue
+        - Key: Environment
+          Value: !Ref EnvironmentTagValue
+        - Key: Stack
+          Value: !Ref ResourcePrefix
+
+  SsmVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      VpcEndpointType: Interface
+      VpcId: !Ref ClusterVpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssm"
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref ClusterSecurityGroupId
+      SubnetIds: !Split [",", !Ref ClusterSubnetIds]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTagValue
+        - Key: Environment
+          Value: !Ref EnvironmentTagValue
+        - Key: Stack
+          Value: !Ref ResourcePrefix
+
+Outputs:
+  ProjectTagKey:
+    Value: Project
+  LambdaCostGroupTagKey:
+    Value: LambdaCostGroup
+  DispatcherLambdaCostGroupValue:
+    Value: dispatcher
+  SchedulerLambdaCostGroupValue:
+    Value: scheduler
+  ControllerLambdaCostGroupValue:
+    Value: controller
+  ProjectTagValue:
+    Value: !Ref ProjectTagValue
+  EnvironmentTagValue:
+    Value: !Ref EnvironmentTagValue
+  DispatcherFunctionName:
+    Value: !Ref DispatcherFunction
+  ScheduleOneFunctionName:
+    Value: !Ref ScheduleOneFunction
+  BinderFunctionName:
+    Value: !Ref BinderFunction
+  BackoffFlushFunctionName:
+    Value: !Ref BackoffFlushFunction
+  UnschedulableFlushFunctionName:
+    Value: !Ref UnschedulableFlushFunction
+  PodGcFunctionName:
+    Value: !Ref PodGcFunction
+  JobControllerFunctionName:
+    Value: !Ref JobControllerFunction
+  TtlAfterFinishedFunctionName:
+    Value: !Ref TtlAfterFinishedFunction
+  NamespaceControllerFunctionName:
+    Value: !Ref NamespaceControllerFunction
+  CacheMapTableName:
+    Value: !Ref CacheMapTable
+  MiscMapTableName:
+    Value: !Ref MiscMapTable
+  ActiveQueueTableName:
+    Value: !Ref ActiveQueueTable
+  BackoffQueueTableName:
+    Value: !Ref BackoffQueueTable
+  DispatcherSelfTriggerQueueUrl:
+    Value: !Ref DispatcherSelfTriggerQueue
+  JobQueueUrl:
+    Value: !Ref JobQueue
+  JobOrphanQueueUrl:
+    Value: !Ref JobOrphanQueue
+  TtlAfterFinishedQueueUrl:
+    Value: !Ref TtlAfterFinishedQueue
+  NamespaceQueueUrl:
+    Value: !Ref NamespaceQueue
