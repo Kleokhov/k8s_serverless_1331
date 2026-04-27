@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -39,6 +40,13 @@ import (
 
 const DefaultTerminatedPodThreshold = 0
 
+// nodeCacheTTL bounds how stale the node list may be. Nodes change infrequently
+// vs. pods, so caching them across RunOnce iterations and across warm Lambda
+// invocations avoids redundant cluster-wide LISTs. The Lambda's appInst is
+// process-global, so a hit here also spans warm invocations of the same
+// execution environment.
+const nodeCacheTTL = 60 * time.Second
+
 type Result struct {
 	PodsListed         int `json:"podsListed"`
 	NodesListed        int `json:"nodesListed"`
@@ -52,6 +60,10 @@ type PodGCController struct {
 	kubeClient kubernetes.Interface
 
 	terminatedPodThreshold int
+
+	nodeCacheMu      sync.Mutex
+	nodeCache        []*v1.Node
+	nodeCacheExpires time.Time
 }
 
 func NewPodGC(kubeClient kubernetes.Interface, terminatedPodThreshold int) (*PodGCController, error) {
@@ -82,6 +94,11 @@ func (gcc *PodGCController) RunOnce(ctx context.Context) (Result, error) {
 	}
 	var errs []error
 
+	nodeByName := make(map[string]*v1.Node, len(nodes))
+	for _, node := range nodes {
+		nodeByName[node.Name] = node
+	}
+
 	// Make it always run
 	if gcc.terminatedPodThreshold > -1 {
 		n, gcErr := gcc.gcTerminated(ctx, pods)
@@ -91,7 +108,7 @@ func (gcc *PodGCController) RunOnce(ctx context.Context) (Result, error) {
 		}
 	}
 
-	n, gcErr := gcc.gcTerminating(ctx, pods)
+	n, gcErr := gcc.gcTerminating(ctx, pods, nodeByName)
 	result.TerminatingDeleted = n
 	if gcErr != nil {
 		errs = append(errs, gcErr)
@@ -135,6 +152,13 @@ func (gcc *PodGCController) listPods(ctx context.Context) ([]*v1.Pod, error) {
 }
 
 func (gcc *PodGCController) listNodes(ctx context.Context) ([]*v1.Node, error) {
+	gcc.nodeCacheMu.Lock()
+	defer gcc.nodeCacheMu.Unlock()
+
+	if gcc.nodeCache != nil && time.Now().Before(gcc.nodeCacheExpires) {
+		return gcc.nodeCache, nil
+	}
+
 	nodeList, err := gcc.kubeClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, err
@@ -143,6 +167,8 @@ func (gcc *PodGCController) listNodes(ctx context.Context) ([]*v1.Node, error) {
 	for i := range nodeList.Items {
 		nodes = append(nodes, &nodeList.Items[i])
 	}
+	gcc.nodeCache = nodes
+	gcc.nodeCacheExpires = time.Now().Add(nodeCacheTTL)
 	return nodes, nil
 }
 
@@ -158,7 +184,7 @@ func isPodTerminating(pod *v1.Pod) bool {
 	return pod.ObjectMeta.DeletionTimestamp != nil
 }
 
-func (gcc *PodGCController) gcTerminating(ctx context.Context, pods []*v1.Pod) (int, error) {
+func (gcc *PodGCController) gcTerminating(ctx context.Context, pods []*v1.Pod, nodeByName map[string]*v1.Node) (int, error) {
 	logger := klog.FromContext(ctx)
 	logger.V(4).Info("GC'ing terminating pods that are on out-of-service nodes")
 	terminatingPods := []*v1.Pod{}
@@ -166,9 +192,10 @@ func (gcc *PodGCController) gcTerminating(ctx context.Context, pods []*v1.Pod) (
 		if !isPodTerminating(pod) {
 			continue
 		}
-		node, err := gcc.kubeClient.CoreV1().Nodes().Get(ctx, pod.Spec.NodeName, metav1.GetOptions{})
-		if err != nil {
-			logger.Error(err, "Failed to get node", "node", klog.KRef("", pod.Spec.NodeName))
+		node, ok := nodeByName[pod.Spec.NodeName]
+		if !ok {
+			// Node missing entirely -- gcOrphaned will handle it.
+			logger.V(4).Info("Skipping terminating pod whose node is not in the listed node set", "pod", klog.KObj(pod), "node", klog.KRef("", pod.Spec.NodeName))
 			continue
 		}
 		if !nodeutil.IsNodeReady(node) && taints.TaintKeyExists(node.Spec.Taints, v1.TaintNodeOutOfService) {

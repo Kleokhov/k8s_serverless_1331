@@ -62,7 +62,12 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 REPO_LOCAL_DIR="${REPO_LOCAL_DIR:-$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null || (cd "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd))}"
 [[ -d "${REPO_LOCAL_DIR}" ]] || { echo "Repo root not found: ${REPO_LOCAL_DIR}"; exit 1; }
 
-K8S_DIR="${K8S_DIR:-${REPO_LOCAL_DIR}/kubernetes}"
+if [[ -z "${K8S_DIR:-}" ]]; then
+  case "${SCHEDULER_MODE}" in
+    normal) K8S_DIR="${REPO_LOCAL_DIR}/kubernetes_local" ;;
+    lambda) K8S_DIR="${REPO_LOCAL_DIR}/kubernetes" ;;
+  esac
+fi
 [[ -d "${K8S_DIR}" ]] || { echo "Missing expected directory: ${K8S_DIR}"; exit 1; }
 [[ -f "${K8S_DIR}/Makefile" ]] || { echo "Does not look like a Kubernetes source tree: ${K8S_DIR}"; exit 1; }
 

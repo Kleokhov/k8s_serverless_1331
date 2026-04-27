@@ -38,8 +38,8 @@ Parameters:
 
 Globals:
   Function:
-    Timeout: 29
-    MemorySize: 1536
+    Timeout: 30
+    MemorySize: 512
     Architectures:
       - x86_64
     PropagateTags: true

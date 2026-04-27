@@ -10,6 +10,11 @@ kube-apiserver-init-path.md
 /_*
 **/_output
 /scripts/_*
+/scripts/test/_*
+/scripts/ec2_k8s/_*
 /.idea
 
 /lambda/.aws-sam
+
+
+/kubernetes_local

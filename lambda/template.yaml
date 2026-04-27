@@ -56,7 +56,7 @@ Parameters:
   # Dispatcher self-chain
   DispatcherSelfTriggerInterval:
     Type: String
-    Default: 30s
+    Default: 15s
     Description: Target period between dispatcher invocations via SQS self-chain.
   # Scheduler
   PodInitialBackoff:
@@ -71,10 +71,10 @@ Parameters:
   # PodGC
   PodGcTerminatedThreshold:
     Type: Number
-    Default: 0
+    Default: 100
   PodGcRunOnceIterations:
     Type: Number
-    Default: 3
+    Default: 1
 
 Conditions:
   ShouldCreateVpcEndpoints: !Equals [!Ref CreateVpcEndpoints, "true"]

@@ -162,6 +162,10 @@ them at a different kubeconfig.
 Start with a small direct-Pod smoke test:
 
 ```bash
+export KUBECONFIG=/home/kelvia/CTRLLess/k8s_serverless_1331/_serverless_out/lambda-apiserver.kubeconfig
+```
+
+```bash
 POD_COUNT=6 \
 POD_RUN_SECONDS=30 \
 WAIT_TIMEOUT=120s \
@@ -224,3 +228,21 @@ deleted; they are reused across deploys and managed by
 for the full option set (`--keep-dynamo`, `--keep-ssm`, `--keep-log-groups`,
 `--keep-artifact-buckets`, `--keep-local-files`, custom stack/prefix overrides,
 etc.).
+
+
+## 6. Redeployment
+
+After redeployment:
+```
+rm -rf ~/.kube/cache
+export KUBECONFIG=/home/kelvia/CTRLLess/k8s_serverless_1331/_serverless_out/lambda-apiserver.kubeconfig
+```
+
+For serverful:
+```
+./scripts/ec2_k8s/setup_ec2.sh --scheduler normal -b create
+```
+
+```
+export KUBECONFIG="$HOME/CTRLLess/k8s_serverless_1331/_ec2_out/admin.public.conf"
+```

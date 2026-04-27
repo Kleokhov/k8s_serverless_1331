@@ -7,56 +7,71 @@ OUT_DIR="${OUT_DIR:-${REPO_LOCAL_DIR}/_serverless_out}"
 
 export KUBECONFIG="${KUBECONFIG:-${OUT_DIR}/lambda-apiserver.kubeconfig}"
 NS="${NS:-hello-test}"
-JOB_BASENAME="${JOB_BASENAME:-scheduler-saturation-test}"
+JOB_BASENAME="${JOB_BASENAME:-normal-workload}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%d%H%M%S)}"
-APP_LABEL="${APP_LABEL:-scheduler-saturation-test}"
+APP_LABEL="${APP_LABEL:-normal-workload}"
 RUN_LABEL="${RUN_LABEL:-${JOB_BASENAME}-${RUN_ID}}"
 TEST_DURATION_SECONDS="${TEST_DURATION_SECONDS:-3600}"
-SUBMISSION_INTERVAL_SECONDS="${SUBMISSION_INTERVAL_SECONDS:-1}"
-MAX_JOBS_PER_INTERVAL="${MAX_JOBS_PER_INTERVAL:-100}"
-TARGET_PENDING_PODS="${TARGET_PENDING_PODS:-250}"
-TARGET_INFLIGHT_PODS="${TARGET_INFLIGHT_PODS:-500}"
+SUBMISSION_INTERVAL_SECONDS="${SUBMISSION_INTERVAL_SECONDS:-30}"
+JOBS_PER_INTERVAL="${JOBS_PER_INTERVAL:-1}"
 WORK_ITEMS="${WORK_ITEMS:-4000}"
-WORKLOAD_SLEEP_SECONDS="${WORKLOAD_SLEEP_SECONDS:-300}"
+WORKLOAD_SLEEP_SECONDS="${WORKLOAD_SLEEP_SECONDS:-20}"
 POD_CPU_REQUEST="${POD_CPU_REQUEST:-150m}"
 POD_MEMORY_REQUEST="${POD_MEMORY_REQUEST:-128Mi}"
-JOB_TTL_SECONDS="${JOB_TTL_SECONDS:-7200}"
+JOB_TTL_SECONDS="${JOB_TTL_SECONDS:-300}"
 WAIT_FOR_COMPLETION="${WAIT_FOR_COMPLETION:-false}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-90m}"
 CLEANUP="${CLEANUP:-false}"
+MEASURE_COST="${MEASURE_COST:-true}"
+MEASURE_COST_TAIL_SECONDS="${MEASURE_COST_TAIL_SECONDS:-60}"
+MEASURE_COST_DELAY_SECONDS="${MEASURE_COST_DELAY_SECONDS:-600}"
+MEASURE_COST_REGION="${MEASURE_COST_REGION:-${AWS_REGION:-us-east-1}}"
+MEASURE_COST_SCRIPT="${MEASURE_COST_SCRIPT:-${SCRIPT_DIR}/measure_cost.py}"
+MEASURE_COST_PYTHON="${MEASURE_COST_PYTHON:-python3}"
+MEASURE_COST_EXTRA_ARGS="${MEASURE_COST_EXTRA_ARGS:-}"
 IMAGE="${IMAGE:-busybox:1.36}"
 IMAGE_PULL_POLICY="${IMAGE_PULL_POLICY:-IfNotPresent}"
 JOB_SELECTOR="app=${APP_LABEL},run=${RUN_LABEL}"
 
 usage() {
   cat <<'EOF_USAGE'
-Usage: ./scripts/test_schedule_minutely.sh
+Usage: ./scripts/test/test_schedule_minutely.sh
 
-This script continuously tops up one-pod Jobs so the scheduler always has fresh pods to place.
-By default it runs for one hour and tries to maintain both:
-  - unscheduled pending pods (pods still waiting for a node assignment)
-  - inflight pods (all non-terminal pods)
+Runs a steady, low-rate Job workload against the serverless pipeline for one
+hour and then computes the AWS cost incurred over that window via
+measure_cost.py. The shape of the workload is meant to imitate a normal
+batch/CI-style usage pattern, not a stress test:
 
-Important design note:
-  - Each Job creates exactly one pod.
-  - This keeps the control loop stable: one submitted Job == one additional pod.
-  - That avoids the overshoot you get when a single Job fans out into many pods.
+  - One Job is submitted every SUBMISSION_INTERVAL_SECONDS (default 30s).
+  - Each Job runs a small sort-and-checksum workload, then sleeps
+    WORKLOAD_SLEEP_SECONDS, so a single Job lasts on the order of seconds.
+  - At any given time only a handful of pods are inflight, which is what a
+    realistic batch tenant looks like.
+  - The namespace is created once and reused; no rotation, no cascade-delete
+    churn.
+  - Finished Jobs are reaped JOB_TTL_SECONDS after completion.
+
+Defaults (1h run, one Job every 30s) submit ~120 Jobs total. Tune the cadence
+or per-Job duration if you want to model a different tenant.
 
 Environment overrides:
   NS=hello-test
   TEST_DURATION_SECONDS=3600
-  SUBMISSION_INTERVAL_SECONDS=1
-  MAX_JOBS_PER_INTERVAL=100
-  TARGET_PENDING_PODS=250
-  TARGET_INFLIGHT_PODS=500
+  SUBMISSION_INTERVAL_SECONDS=30
+  JOBS_PER_INTERVAL=1
   WORK_ITEMS=4000
-  WORKLOAD_SLEEP_SECONDS=300
+  WORKLOAD_SLEEP_SECONDS=20
   POD_CPU_REQUEST=150m
   POD_MEMORY_REQUEST=128Mi
-  JOB_TTL_SECONDS=7200
+  JOB_TTL_SECONDS=300
   WAIT_FOR_COMPLETION=false
   WAIT_TIMEOUT=90m
   CLEANUP=false
+  MEASURE_COST=true
+  MEASURE_COST_TAIL_SECONDS=60
+  MEASURE_COST_DELAY_SECONDS=600       (CloudWatch AWS/Logs lags ~10m)
+  MEASURE_COST_REGION=us-east-1
+  MEASURE_COST_EXTRA_ARGS=""
 EOF_USAGE
 }
 
@@ -111,59 +126,53 @@ ensure_valid_job_name() {
   fi
 }
 
+KUBECTL_APPLY_RETRIES="${KUBECTL_APPLY_RETRIES:-8}"
+KUBECTL_APPLY_RETRY_BASE_MS="${KUBECTL_APPLY_RETRY_BASE_MS:-150}"
+
+kubectl_apply_retry() {
+  local attempt=1
+  local stderr_file
+  stderr_file="$(mktemp)"
+  local input
+  input="$(cat)"
+
+  while :; do
+    if printf '%s' "${input}" | kubectl apply "$@" 2>"${stderr_file}"; then
+      rm -f "${stderr_file}"
+      return 0
+    fi
+
+    local err
+    err="$(cat "${stderr_file}")"
+    if (( attempt >= KUBECTL_APPLY_RETRIES )) \
+       || ! grep -qE 'TransactionConflict|TransactionCanceledException|Conflict|the object has been modified|try again|i/o timeout|connection reset|TooManyRequests|429' <<< "${err}"; then
+      echo "${err}" >&2
+      rm -f "${stderr_file}"
+      return 1
+    fi
+
+    local backoff_ms=$(( KUBECTL_APPLY_RETRY_BASE_MS * (1 << (attempt - 1)) ))
+    if (( backoff_ms > 5000 )); then backoff_ms=5000; fi
+    local jitter_ms=$(( RANDOM % 100 ))
+    sleep "$(awk -v b="${backoff_ms}" -v j="${jitter_ms}" 'BEGIN { printf "%.3f", (b + j) / 1000 }')"
+    attempt=$((attempt + 1))
+  done
+}
+
 print_status() {
   echo
-  echo "[*] Jobs for selector ${JOB_SELECTOR}:"
+  echo "[*] Jobs in ${NS} (selector ${JOB_SELECTOR}):"
   kubectl -n "${NS}" get jobs -l "${JOB_SELECTOR}" || true
   echo
-  echo "[*] Pods for selector ${JOB_SELECTOR}:"
+  echo "[*] Pods in ${NS} (selector ${JOB_SELECTOR}):"
   kubectl -n "${NS}" get pods -l "${JOB_SELECTOR}" -o wide || true
-}
-
-count_pods() {
-  local pod_rows=""
-
-  pod_rows="$(kubectl -n "${NS}" get pods -l "${JOB_SELECTOR}" \
-    -o jsonpath='{range .items[*]}{.status.phase}{","}{.spec.nodeName}{"\n"}{end}' 2>/dev/null || true)"
-
-  awk -F, '
-    BEGIN {
-      unscheduled_pending = 0
-      inflight = 0
-    }
-    NF {
-      phase = $1
-      node = $2
-
-      if (phase == "Pending" && node == "") {
-        unscheduled_pending++
-      }
-
-      if (phase != "Succeeded" && phase != "Failed") {
-        inflight++
-      }
-    }
-    END {
-      printf "%d %d\n", unscheduled_pending, inflight
-    }
-  ' <<< "${pod_rows}"
-}
-
-jobs_needed_for_deficit() {
-  local deficit="$1"
-
-  if (( deficit <= 0 )); then
-    echo 0
-  else
-    echo "${deficit}"
-  fi
 }
 
 create_job() {
   local job_index="$1"
   local job_name="$2"
 
-  cat <<EOF_JOB | kubectl apply -n "${NS}" -f -
+  cat <<EOF_JOB | kubectl_apply_retry -n "${NS}" -f -
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -250,19 +259,15 @@ fi
 
 require_positive_integer "TEST_DURATION_SECONDS" "${TEST_DURATION_SECONDS}"
 require_positive_integer "SUBMISSION_INTERVAL_SECONDS" "${SUBMISSION_INTERVAL_SECONDS}"
-require_positive_integer "MAX_JOBS_PER_INTERVAL" "${MAX_JOBS_PER_INTERVAL}"
-require_non_negative_integer "TARGET_PENDING_PODS" "${TARGET_PENDING_PODS}"
-require_non_negative_integer "TARGET_INFLIGHT_PODS" "${TARGET_INFLIGHT_PODS}"
+require_positive_integer "JOBS_PER_INTERVAL" "${JOBS_PER_INTERVAL}"
 require_positive_integer "WORK_ITEMS" "${WORK_ITEMS}"
 require_non_negative_integer "WORKLOAD_SLEEP_SECONDS" "${WORKLOAD_SLEEP_SECONDS}"
 require_positive_integer "JOB_TTL_SECONDS" "${JOB_TTL_SECONDS}"
 require_boolean "WAIT_FOR_COMPLETION" "${WAIT_FOR_COMPLETION}"
 require_boolean "CLEANUP" "${CLEANUP}"
-
-if (( TARGET_PENDING_PODS > TARGET_INFLIGHT_PODS )); then
-  echo "TARGET_PENDING_PODS cannot be greater than TARGET_INFLIGHT_PODS" >&2
-  exit 1
-fi
+require_boolean "MEASURE_COST" "${MEASURE_COST}"
+require_non_negative_integer "MEASURE_COST_TAIL_SECONDS" "${MEASURE_COST_TAIL_SECONDS}"
+require_non_negative_integer "MEASURE_COST_DELAY_SECONDS" "${MEASURE_COST_DELAY_SECONDS}"
 
 if (( ${#APP_LABEL} > 63 )); then
   echo "APP_LABEL must be 63 characters or fewer, got: ${APP_LABEL}" >&2
@@ -274,24 +279,32 @@ if (( ${#RUN_LABEL} > 63 )); then
   exit 1
 fi
 
+if (( ${#NS} > 63 )); then
+  echo "NS must be 63 characters or fewer, got: ${NS}" >&2
+  exit 1
+fi
+
 trap 'echo; echo "[!] Interrupted. Current status:"; print_status; exit 130' INT TERM
-
-kubectl create namespace "${NS}" --dry-run=client -o yaml | kubectl apply -f -
-
-echo "[*] Starting continuous scheduler saturation run"
-echo "[*] Namespace: ${NS}"
-echo "[*] Selector: ${JOB_SELECTOR}"
-echo "[*] Duration: ${TEST_DURATION_SECONDS}s"
-echo "[*] Submission interval: ${SUBMISSION_INTERVAL_SECONDS}s"
-echo "[*] Max jobs per interval: ${MAX_JOBS_PER_INTERVAL}"
-echo "[*] Per-job pods: completions=1 parallelism=1"
-echo "[*] Target backlog: unscheduled_pending=${TARGET_PENDING_PODS} inflight=${TARGET_INFLIGHT_PODS}"
-echo "[*] Workload: generate ${WORK_ITEMS} numbers, sort them, compute summary, sleep ${WORKLOAD_SLEEP_SECONDS}s"
 
 start_epoch="$(date +%s)"
 end_epoch=$((start_epoch + TEST_DURATION_SECONDS))
+START_ISO="$(date -u -d "@${start_epoch}" '+%Y-%m-%dT%H:%M:%SZ')"
 submitted_jobs=0
 iteration=0
+
+echo "[*] Ensuring namespace ${NS} exists"
+kubectl create namespace "${NS}" --dry-run=client -o yaml | kubectl_apply_retry -f -
+
+expected_jobs=$(( (TEST_DURATION_SECONDS / SUBMISSION_INTERVAL_SECONDS) * JOBS_PER_INTERVAL ))
+
+echo "[*] Starting steady-state workload run"
+echo "[*] Namespace: ${NS}"
+echo "[*] Selector: ${JOB_SELECTOR}"
+echo "[*] Duration: ${TEST_DURATION_SECONDS}s"
+echo "[*] Submission interval: ${SUBMISSION_INTERVAL_SECONDS}s (${JOBS_PER_INTERVAL} job(s) per interval, ~${expected_jobs} jobs total)"
+echo "[*] Per-job pods: completions=1 parallelism=1"
+echo "[*] Workload: generate ${WORK_ITEMS} numbers, sort, summarize, sleep ${WORKLOAD_SLEEP_SECONDS}s"
+echo "[*] Job ttlSecondsAfterFinished: ${JOB_TTL_SECONDS}s"
 
 while :; do
   now_epoch="$(date +%s)"
@@ -300,26 +313,8 @@ while :; do
   fi
 
   iteration=$((iteration + 1))
-  read -r unscheduled_pending_pods inflight_pods < <(count_pods)
-
-  pending_deficit=$((TARGET_PENDING_PODS - unscheduled_pending_pods))
-  inflight_deficit=$((TARGET_INFLIGHT_PODS - inflight_pods))
-
-  jobs_for_pending="$(jobs_needed_for_deficit "${pending_deficit}")"
-  jobs_for_inflight="$(jobs_needed_for_deficit "${inflight_deficit}")"
-  jobs_to_submit="${jobs_for_pending}"
-  if (( jobs_for_inflight > jobs_to_submit )); then
-    jobs_to_submit="${jobs_for_inflight}"
-  fi
-  if (( jobs_to_submit > MAX_JOBS_PER_INTERVAL )); then
-    jobs_to_submit="${MAX_JOBS_PER_INTERVAL}"
-  fi
-
-  echo "[*] ($(date -u '+%Y-%m-%dT%H:%M:%SZ')) iteration=${iteration} unscheduled_pending=${unscheduled_pending_pods} inflight=${inflight_pods} pending_deficit=${pending_deficit} inflight_deficit=${inflight_deficit} jobs_to_submit=${jobs_to_submit}"
-
-  if (( jobs_to_submit > 0 )); then
-    submit_jobs "${jobs_to_submit}" submitted_jobs
-  fi
+  echo "[*] ($(date -u '+%Y-%m-%dT%H:%M:%SZ')) iteration=${iteration} submitting=${JOBS_PER_INTERVAL}"
+  submit_jobs "${JOBS_PER_INTERVAL}" submitted_jobs
 
   now_epoch="$(date +%s)"
   remaining_seconds=$((end_epoch - now_epoch))
@@ -342,18 +337,47 @@ print_status
 
 if [[ "${WAIT_FOR_COMPLETION}" == "true" ]]; then
   echo
-  echo "[*] Waiting for submitted jobs to complete..."
+  echo "[*] Waiting for submitted jobs in ${NS} to complete..."
   kubectl -n "${NS}" wait --for=condition=complete job -l "${JOB_SELECTOR}" --timeout="${WAIT_TIMEOUT}"
   print_status
 fi
 
 if [[ "${CLEANUP}" == "true" ]]; then
   echo
-  echo "[*] Cleaning up jobs for this run..."
-  kubectl -n "${NS}" delete jobs -l "${JOB_SELECTOR}" --ignore-not-found=true
+  echo "[*] Cleaning up jobs in ${NS} (selector ${JOB_SELECTOR})..."
+  kubectl -n "${NS}" delete jobs -l "${JOB_SELECTOR}" --wait=false --ignore-not-found=true
 else
   echo
-  echo "[*] Leaving jobs in place. Inspect them with:"
+  echo "[*] Leaving resources in place. Inspect them with:"
   echo "kubectl -n ${NS} get jobs -l ${JOB_SELECTOR}"
   echo "kubectl -n ${NS} get pods -l ${JOB_SELECTOR} -o wide"
+fi
+
+if [[ "${MEASURE_COST}" == "true" ]]; then
+  if [[ ! -f "${MEASURE_COST_SCRIPT}" ]]; then
+    echo
+    echo "[!] MEASURE_COST=true but script not found: ${MEASURE_COST_SCRIPT}" >&2
+  else
+    if (( MEASURE_COST_TAIL_SECONDS > 0 )); then
+      echo
+      echo "[*] Draining ${MEASURE_COST_TAIL_SECONDS}s before closing the cost window (lets cleanup/cascade settle)"
+      sleep "${MEASURE_COST_TAIL_SECONDS}"
+    fi
+    END_ISO="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    echo "[*] Cost window: ${START_ISO}  ->  ${END_ISO}"
+
+    if (( MEASURE_COST_DELAY_SECONDS > 0 )); then
+      echo "[*] Waiting ${MEASURE_COST_DELAY_SECONDS}s for CloudWatch metrics to publish (AWS/Logs lags ~10m; AWS/Lambda+DynamoDB+SQS land in ~1-3m)"
+      sleep "${MEASURE_COST_DELAY_SECONDS}"
+    fi
+
+    echo
+    echo "[*] Running measure_cost.py for window [${START_ISO}, ${END_ISO}] in region ${MEASURE_COST_REGION}"
+    # shellcheck disable=SC2086
+    "${MEASURE_COST_PYTHON}" "${MEASURE_COST_SCRIPT}" \
+      --start "${START_ISO}" \
+      --end "${END_ISO}" \
+      --region "${MEASURE_COST_REGION}" \
+      ${MEASURE_COST_EXTRA_ARGS} || echo "[!] measure_cost.py exited non-zero"
+  fi
 fi

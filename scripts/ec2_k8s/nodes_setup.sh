@@ -21,9 +21,14 @@ OUT_DIR="${OUT_DIR:-${REPO_LOCAL_DIR}/_ec2_out}"
 # shellcheck source=/dev/null
 source "${OUT_DIR}/cluster.env"
 
-K8S_DIR="${K8S_DIR:-${REPO_LOCAL_DIR}/kubernetes}"
 GO_VERSION="${GO_VERSION:-1.24.6}"
 SCHEDULER_MODE="${SCHEDULER_MODE:-normal}"
+if [[ -z "${K8S_DIR:-}" ]]; then
+  case "${SCHEDULER_MODE}" in
+    lambda) K8S_DIR="${REPO_LOCAL_DIR}/kubernetes" ;;
+    *)      K8S_DIR="${REPO_LOCAL_DIR}/kubernetes_local" ;;
+  esac
+fi
 KUBERNETES_VERSION="${KUBERNETES_VERSION:-v1.33.1}"
 PODGC_CONTROLLER_NAME="${PODGC_CONTROLLER_NAME:-pod-garbage-collector-controller}"
 JOB_CONTROLLER_NAME="${JOB_CONTROLLER_NAME:-job-controller}"

@@ -48,7 +48,7 @@ CNI_PLUGINS_VERSION="${CNI_PLUGINS_VERSION:-v1.5.1}"
 VPC_CIDR="${VPC_CIDR:-10.52.0.0/16}"
 SUBNET_CIDR="${SUBNET_CIDR:-10.52.1.0/24}"
 STORAGE_INSTANCE_TYPE="${STORAGE_INSTANCE_TYPE:-m4.large}"
-CONTROL_INSTANCE_TYPE="${CONTROL_INSTANCE_TYPE:-c6i.xlarge}"
+CONTROL_INSTANCE_TYPE="${CONTROL_INSTANCE_TYPE:-t3.medium}"
 WORKER_INSTANCE_TYPE="${WORKER_INSTANCE_TYPE:-t3.large}"
 ROOT_VOL_GB="${ROOT_VOL_GB:-64}"
 
@@ -663,7 +663,13 @@ ENV_FILE="${OUT_DIR}/cluster.env"
   emit_env CNI_MANIFEST_URL "${CNI_MANIFEST_URL}"
   emit_env CNI_PLUGINS_VERSION "${CNI_PLUGINS_VERSION}"
   emit_env REPO_LOCAL_DIR "${REPO_LOCAL_DIR}"
-  emit_env K8S_DIR "${K8S_DIR:-${REPO_LOCAL_DIR}/kubernetes}"
+  if [[ -n "${K8S_DIR:-}" ]]; then
+    emit_env K8S_DIR "${K8S_DIR}"
+  elif [[ "${SCHEDULER_MODE}" == "lambda" ]]; then
+    emit_env K8S_DIR "${REPO_LOCAL_DIR}/kubernetes"
+  else
+    emit_env K8S_DIR "${REPO_LOCAL_DIR}/kubernetes_local"
+  fi
   emit_env OUT_DIR "${OUT_DIR}"
   emit_env VPC_ID "${VPC_ID}"
   emit_env RT_ID "${RT_ID}"

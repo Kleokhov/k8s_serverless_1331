@@ -274,11 +274,9 @@ if [[ "${SKIP_BUILD}" == "1" ]]; then
   }
   echo "[*] Skipping SAM build; reusing ${built_template}"
 else
-  echo "[*] Fixing Go module cache permissions for SAM source copy"
-  find "${REPO_LOCAL_DIR}/kubernetes/_output" -type d ! -writable -exec chmod u+w {} \; 2>/dev/null || true
-
   echo "[*] Building Lambda scheduler/dispatcher/controller stack"
   sam build \
+    --build-in-source \
     --template-file "${SCHEDULER_TEMPLATE}" \
     --build-dir "${OUT_DIR}/.aws-sam-scheduler"
 fi
