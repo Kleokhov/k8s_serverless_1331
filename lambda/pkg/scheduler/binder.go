@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"strconv"
@@ -9,6 +10,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
@@ -45,6 +47,8 @@ func (sched *Scheduler) CompleteBinding(ctx context.Context, req BindingRequest)
 		status := sched.bindingCycleFast(ctx, fwk, scheduleResult, podInfo, start)
 		if !status.IsSuccess() {
 			sched.handleBindingCycleError(ctx, nil, fwk, podInfo, start, scheduleResult, status, false)
+		} else {
+			sched.annotateBindingTimestamps(ctx, podInfo.Pod, req)
 		}
 		return nil
 	}
@@ -61,9 +65,41 @@ func (sched *Scheduler) CompleteBinding(ctx context.Context, req BindingRequest)
 	status, reserved := sched.bindingCycle(ctx, state, fwk, scheduleResult, podInfo, start, podsToActivate)
 	if !status.IsSuccess() {
 		sched.handleBindingCycleError(ctx, state, fwk, podInfo, start, scheduleResult, status, reserved)
+	} else {
+		sched.annotateBindingTimestamps(ctx, podInfo.Pod, req)
 	}
 
 	return nil
+}
+
+func (sched *Scheduler) annotateBindingTimestamps(ctx context.Context, pod *v1.Pod, req BindingRequest) {
+	if sched == nil || sched.client == nil || pod == nil {
+		return
+	}
+
+	annotations := map[string]string{
+		ServerlessBoundAtAnnotation: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if !req.ScheduledAt.IsZero() {
+		annotations[ServerlessScheduledAtAnnotation] = req.ScheduledAt.UTC().Format(time.RFC3339Nano)
+	}
+
+	patch := struct {
+		Metadata struct {
+			Annotations map[string]string `json:"annotations"`
+		} `json:"metadata"`
+	}{}
+	patch.Metadata.Annotations = annotations
+
+	payload, err := json.Marshal(patch)
+	if err != nil {
+		klog.FromContext(ctx).Error(err, "Failed to marshal scheduling timestamp annotations", "pod", klog.KObj(pod))
+		return
+	}
+
+	if _, err := sched.client.CoreV1().Pods(pod.Namespace).Patch(ctx, pod.Name, types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+		klog.FromContext(ctx).Error(err, "Failed to annotate scheduling timestamps", "pod", klog.KObj(pod))
+	}
 }
 
 // bindingCycle tries to bind an assumed Pod.
@@ -135,7 +171,8 @@ func (sched *Scheduler) bindingCycleFast(
 	logger := klog.FromContext(ctx)
 	assumedPod := assumedPodInfo.Pod
 
-	if status := sched.ensureBindingTarget(ctx, assumedPod, scheduleResult.SuggestedHost); !status.IsSuccess() {
+	state := framework.NewCycleState()
+	if status := sched.validateBindingTarget(ctx, state, fwk, assumedPod, scheduleResult.SuggestedHost); !status.IsSuccess() {
 		return status
 	}
 
@@ -163,34 +200,8 @@ func (sched *Scheduler) prepareBindingCycle(
 	pod *v1.Pod,
 	targetNode string,
 ) (*framework.Status, bool) {
-	nodeInfo, status := sched.bindingNodeInfo(ctx, pod, targetNode)
-	if !status.IsSuccess() {
+	if status := sched.validateBindingTarget(ctx, state, fwk, pod, targetNode); !status.IsSuccess() {
 		return status, false
-	}
-
-	preRes, status, _ := fwk.RunPreFilterPlugins(ctx, state, pod)
-	if !status.IsSuccess() {
-		if !status.IsRejected() {
-			return status, false
-		}
-		rejected := bindingRejectedStatus(pod, targetNode, status)
-		if fitErr, ok := rejected.AsError().(*framework.FitError); ok {
-			fitErr.Diagnosis.PreFilterMsg = status.Message()
-		}
-		return rejected, false
-	}
-
-	if !preRes.AllNodes() && (preRes.NodeNames == nil || !preRes.NodeNames.Has(targetNode)) {
-		status := framework.NewStatus(framework.UnschedulableAndUnresolvable, fmt.Sprintf("node %q didn't satisfy prefilter results", targetNode))
-		return bindingRejectedStatus(pod, targetNode, status), false
-	}
-
-	filterStatus := fwk.RunFilterPluginsWithNominatedPods(ctx, state, pod, nodeInfo)
-	if filterStatus.Code() == framework.Error {
-		return filterStatus, false
-	}
-	if !filterStatus.IsSuccess() {
-		return bindingRejectedStatus(pod, targetNode, filterStatus), false
 	}
 
 	// Reserve plugins may need to clean up even if one of them fails midway through the chain.
@@ -213,6 +224,53 @@ func (sched *Scheduler) prepareBindingCycle(
 	return nil, reserved
 }
 
+func (sched *Scheduler) validateBindingTarget(
+	ctx context.Context,
+	state *framework.CycleState,
+	fwk framework.Framework,
+	pod *v1.Pod,
+	targetNode string,
+) *framework.Status {
+	logger := klog.FromContext(ctx)
+	nodeInfo, status := sched.bindingNodeInfo(ctx, pod, targetNode)
+	if !status.IsSuccess() {
+		return status
+	}
+
+	validationNodeInfo := nodeInfo.Snapshot()
+	if err := validationNodeInfo.RemovePod(logger, pod); err != nil {
+		logger.V(5).Info("Assumed pod was not present in binding validation snapshot",
+			"pod", klog.KObj(pod), "targetNode", targetNode, "err", err)
+	}
+
+	preRes, status, _ := fwk.RunPreFilterPlugins(ctx, state, pod)
+	if !status.IsSuccess() {
+		if !status.IsRejected() {
+			return status
+		}
+		rejected := bindingRejectedStatus(pod, targetNode, status)
+		if fitErr, ok := rejected.AsError().(*framework.FitError); ok {
+			fitErr.Diagnosis.PreFilterMsg = status.Message()
+		}
+		return rejected
+	}
+
+	if !preRes.AllNodes() && (preRes.NodeNames == nil || !preRes.NodeNames.Has(targetNode)) {
+		status := framework.NewStatus(framework.UnschedulableAndUnresolvable, fmt.Sprintf("node %q didn't satisfy prefilter results", targetNode))
+		return bindingRejectedStatus(pod, targetNode, status)
+	}
+
+	filterStatus := fwk.RunFilterPluginsWithNominatedPods(ctx, state, pod, validationNodeInfo)
+	if filterStatus.Code() == framework.Error {
+		return filterStatus
+	}
+	if !filterStatus.IsSuccess() {
+		return bindingRejectedStatus(pod, targetNode, filterStatus)
+	}
+
+	return nil
+}
+
 func (sched *Scheduler) ensureBindingTarget(ctx context.Context, pod *v1.Pod, targetNode string) *framework.Status {
 	_, status := sched.bindingNodeInfo(ctx, pod, targetNode)
 	return status
@@ -220,13 +278,11 @@ func (sched *Scheduler) ensureBindingTarget(ctx context.Context, pod *v1.Pod, ta
 
 func (sched *Scheduler) bindingNodeInfo(ctx context.Context, pod *v1.Pod, targetNode string) (*framework.NodeInfo, *framework.Status) {
 	logger := klog.FromContext(ctx)
-	snapshot, err := sched.Cache.UpdateSnapshot(logger)
+	nodeInfo, found, err := sched.Cache.GetNodeInfo(logger, targetNode)
 	if err != nil {
 		return nil, framework.AsStatus(err)
 	}
-
-	nodeInfo, ok := snapshot[targetNode]
-	if !ok || nodeInfo == nil || nodeInfo.Node() == nil {
+	if !found || nodeInfo == nil || nodeInfo.Node() == nil {
 		status := framework.NewStatus(framework.UnschedulableAndUnresolvable, fmt.Sprintf("node %q was not found in the current snapshot", targetNode))
 		return nil, bindingRejectedStatus(pod, targetNode, status)
 	}

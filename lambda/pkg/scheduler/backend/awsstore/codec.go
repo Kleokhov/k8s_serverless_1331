@@ -116,9 +116,17 @@ type AssumedPodRecord struct {
 	PodKey string `json:"podKey"`
 }
 
+// NodeRecord is the in-memory aggregate view of a node and its assigned pods.
+//
+// Pods are NOT persisted inline with the rest of the record: they are stored as
+// separate DynamoDB items keyed by node and pod UID (see CacheStore for the
+// schema). This avoids the 400 KB per-item limit that the inlined-pods layout
+// previously hit at ~150 pods/node. The Pods field is populated by GetNode /
+// ListNodes when assembling the record from the split items, and ignored by
+// UpsertNodeMeta when persisting metadata.
 type NodeRecord struct {
 	Node       *corev1.Node  `json:"node,omitempty"`
-	Pods       []*corev1.Pod `json:"pods,omitempty"`
+	Pods       []*corev1.Pod `json:"-"`
 	Generation int64         `json:"generation"`
 	UpdatedAt  time.Time     `json:"updatedAt"`
 }
@@ -147,12 +155,58 @@ func unmarshalPodStateRecord(data []byte) (*PodStateRecord, error) {
 	return &out, nil
 }
 
-func unmarshalNodeRecord(data []byte) (*NodeRecord, error) {
-	var out NodeRecord
-	if err := json.Unmarshal(data, &out); err != nil {
+// nodeMetaWire is the persisted on-disk shape of node metadata. It mirrors
+// NodeRecord without the Pods slice — pods are stored as separate items.
+type nodeMetaWire struct {
+	Node       *corev1.Node `json:"node,omitempty"`
+	Generation int64        `json:"generation"`
+	UpdatedAt  time.Time    `json:"updatedAt"`
+}
+
+func marshalNodeMeta(rec *NodeRecord) ([]byte, error) {
+	if rec == nil {
+		return nil, fmt.Errorf("nil node record")
+	}
+	return json.Marshal(&nodeMetaWire{
+		Node:       rec.Node,
+		Generation: rec.Generation,
+		UpdatedAt:  rec.UpdatedAt,
+	})
+}
+
+func unmarshalNodeMeta(data []byte) (*NodeRecord, error) {
+	var w nodeMetaWire
+	if err := json.Unmarshal(data, &w); err != nil {
 		return nil, err
 	}
-	return &out, nil
+	return &NodeRecord{
+		Node:       w.Node,
+		Generation: w.Generation,
+		UpdatedAt:  w.UpdatedAt,
+	}, nil
+}
+
+// nodePodWire is the persisted shape of a single pod assigned to a node.
+type nodePodWire struct {
+	Pod *corev1.Pod `json:"pod"`
+}
+
+func marshalNodePod(pod *corev1.Pod) ([]byte, error) {
+	if pod == nil {
+		return nil, fmt.Errorf("nil pod")
+	}
+	return json.Marshal(&nodePodWire{Pod: pod})
+}
+
+func unmarshalNodePod(data []byte) (*corev1.Pod, error) {
+	var w nodePodWire
+	if err := json.Unmarshal(data, &w); err != nil {
+		return nil, err
+	}
+	if w.Pod == nil {
+		return nil, fmt.Errorf("node pod payload missing pod")
+	}
+	return w.Pod, nil
 }
 
 type DispatchJobState struct {

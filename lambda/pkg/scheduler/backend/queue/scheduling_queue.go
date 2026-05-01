@@ -132,6 +132,12 @@ type SchedulingQueue interface {
 
 	FlushBackoffQCompletedOnce(logger klog.Logger) int
 	FlushUnschedulablePodsLeftoverOnce(logger klog.Logger) int
+
+	// ResetNamespaceLabelsCache clears the per-invocation namespace labels
+	// cache used during cross-namespace topology spread evaluation. The
+	// dispatcher must call this at the start of each reconcile so the
+	// next invocation observes fresh namespace labels.
+	ResetNamespaceLabelsCache()
 }
 
 // NewSchedulingQueue initializes a priority queue as a new scheduling queue.
@@ -175,6 +181,15 @@ type PriorityQueue struct {
 	// when we received move request.
 	// TODO: this will be removed after SchedulingQueueHint goes to stable and the feature gate is removed.
 	moveRequestCycle int64
+
+	// nsLabelsCache memoizes namespace label snapshots within a single
+	// reconcile/invocation so cross-namespace topology spread evaluation
+	// does not issue one Namespaces().Get() per pod when there is no
+	// informer-backed lister (no-watch build). Callers must invoke
+	// ResetNamespaceLabelsCache at the start of each invocation; presence
+	// of a key indicates a cached result, including the empty/error case.
+	nsLabelsCacheMu sync.Mutex
+	nsLabelsCache   map[string]labels.Set
 }
 
 type priorityQueueOptions struct {
@@ -781,19 +796,46 @@ func (p *PriorityQueue) movePodsToActiveOrBackoffQueue(logger klog.Logger, podIn
 	p.moveRequestCycle = p.activeQ.schedulingCycle()
 }
 
+// ResetNamespaceLabelsCache clears the per-invocation namespace labels
+// cache. The dispatcher calls this at the start of every reconcile so the
+// next invocation observes fresh namespace labels while still amortizing
+// Namespaces().Get() calls within a single invocation.
+func (p *PriorityQueue) ResetNamespaceLabelsCache() {
+	p.nsLabelsCacheMu.Lock()
+	p.nsLabelsCache = make(map[string]labels.Set)
+	p.nsLabelsCacheMu.Unlock()
+}
+
 func (p *PriorityQueue) getNamespaceLabelsSnapshot(logger klog.Logger, ns string) (nsLabels labels.Set) {
 	if p.kubeClient == nil {
 		logger.V(3).Info("kubeClient is nil, assuming empty set of namespace labels", "namespace", ns)
 		return
 	}
 
+	p.nsLabelsCacheMu.Lock()
+	if p.nsLabelsCache != nil {
+		if cached, ok := p.nsLabelsCache[ns]; ok {
+			p.nsLabelsCacheMu.Unlock()
+			return cached
+		}
+	}
+	p.nsLabelsCacheMu.Unlock()
+
+	var result labels.Set
 	podNS, err := p.kubeClient.CoreV1().Namespaces().Get(context.TODO(), ns, metav1.GetOptions{})
 	if err == nil {
-		return labels.Merge(podNS.Labels, nil)
+		result = labels.Merge(podNS.Labels, nil)
+	} else {
+		logger.V(3).Info("getting namespace, assuming empty set of namespace labels", "namespace", ns, "err", err)
 	}
 
-	logger.V(3).Info("getting namespace, assuming empty set of namespace labels", "namespace", ns, "err", err)
-	return
+	p.nsLabelsCacheMu.Lock()
+	if p.nsLabelsCache == nil {
+		p.nsLabelsCache = make(map[string]labels.Set)
+	}
+	p.nsLabelsCache[ns] = result
+	p.nsLabelsCacheMu.Unlock()
+	return result
 }
 
 // getUnschedulablePodsWithCrossTopologyTerm returns unschedulable pods which either of following conditions is met:

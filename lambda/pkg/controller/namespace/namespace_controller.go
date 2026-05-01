@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -36,18 +37,34 @@ import (
 	"k8s.io/utils/clock"
 )
 
-const (
-	// namespaceDeletionGracePeriod is the time period to wait before processing a received namespace event.
-	// This allows time for the following to occur:
-	// * lifecycle admission plugins on HA apiservers to also observe a namespace
-	//   deletion and prevent new objects from being created in the terminating namespace
-	// * non-leader etcd servers to observe last-minute object creations in a namespace
-	//   so this controller's cleanup can actually clean up all objects
-	namespaceDeletionGracePeriod = 5 * time.Second
+// defaultNamespaceDeletionGracePeriod is the time period to wait before processing a received namespace event.
+// Upstream uses 5s so HA apiservers can converge admission state and non-leader etcd servers can observe
+// last-minute object creations. The serverless apiserver here is single-instance, so the wait is unnecessary
+// in the common case. Override via the NAMESPACE_DELETION_GRACE_PERIOD env var.
+const defaultNamespaceDeletionGracePeriod = 0 * time.Second
 
+// defaultRequeueMaxDelay caps how long the controller waits before retrying a namespace whose
+// resources are still being deleted. Upstream uses estimate/2 + 1 (seconds), which can run into
+// the tens of seconds when pods have nonzero terminationGracePeriodSeconds. Override via
+// NAMESPACE_REQUEUE_MAX_DELAY.
+const defaultRequeueMaxDelay = 5 * time.Second
+
+const (
 	DefaultQueueBatchSize         int32         = 10
-	DefaultQueueVisibilityTimeout time.Duration = 30 * time.Second
+	DefaultQueueVisibilityTimeout time.Duration = 120 * time.Second
 )
+
+func envDuration(name string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 0 {
+		return def
+	}
+	return d
+}
 
 // NamespaceController is responsible for cleaning up terminating namespaces.
 // In the serverless flow, namespace names arrive through SQS and RunOnce
@@ -61,6 +78,9 @@ type NamespaceController struct {
 
 	queueBatchSize         int32
 	queueVisibilityTimeout time.Duration
+
+	deletionGracePeriod time.Duration
+	requeueMaxDelay     time.Duration
 
 	clock clock.Clock
 }
@@ -136,6 +156,8 @@ func NewLambdaController(
 		),
 		queueBatchSize:         DefaultQueueBatchSize,
 		queueVisibilityTimeout: DefaultQueueVisibilityTimeout,
+		deletionGracePeriod:    envDuration("NAMESPACE_DELETION_GRACE_PERIOD", defaultNamespaceDeletionGracePeriod),
+		requeueMaxDelay:        envDuration("NAMESPACE_REQUEUE_MAX_DELAY", defaultRequeueMaxDelay),
 		clock:                  clock.RealClock{},
 	}
 
@@ -265,12 +287,14 @@ func (nm *NamespaceController) processNamespace(ctx context.Context, key string)
 		return namespaceOutcomeSkipped, nil
 	}
 
-	if remainingGrace := namespace.DeletionTimestamp.Time.Add(namespaceDeletionGracePeriod).Sub(nm.clock.Now()); remainingGrace > 0 {
-		logger.V(2).Info("Namespace still within deletion grace period; re-enqueueing", "namespace", key, "remaining", remainingGrace)
-		if err := nm.enqueueNamespaceAfter(ctx, key, remainingGrace); err != nil {
-			return namespaceOutcomeSkipped, err
+	if nm.deletionGracePeriod > 0 {
+		if remainingGrace := namespace.DeletionTimestamp.Time.Add(nm.deletionGracePeriod).Sub(nm.clock.Now()); remainingGrace > 0 {
+			logger.V(2).Info("Namespace still within deletion grace period; re-enqueueing", "namespace", key, "remaining", remainingGrace)
+			if err := nm.enqueueNamespaceAfter(ctx, key, remainingGrace); err != nil {
+				return namespaceOutcomeSkipped, err
+			}
+			return namespaceOutcomeRequeued, nil
 		}
-		return namespaceOutcomeRequeued, nil
 	}
 
 	err = nm.namespacedResourcesDeleter.Delete(ctx, namespace.Name)
@@ -282,6 +306,9 @@ func (nm *NamespaceController) processNamespace(ctx context.Context, key string)
 	if estimate, ok := err.(*deletion.ResourcesRemainingError); ok {
 		delaySeconds := estimate.Estimate/2 + 1
 		delay := time.Duration(delaySeconds) * time.Second
+		if nm.requeueMaxDelay > 0 && delay > nm.requeueMaxDelay {
+			delay = nm.requeueMaxDelay
+		}
 		logger.V(2).Info("Content remaining in namespace; re-enqueueing", "namespace", key, "delay", delay)
 		if enqueueErr := nm.enqueueNamespaceAfter(ctx, key, delay); enqueueErr != nil {
 			return namespaceOutcomeSkipped, enqueueErr

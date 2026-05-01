@@ -5,12 +5,13 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"time"
 
 	lambdaruntime "github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	awslambda "github.com/aws/aws-sdk-go-v2/service/lambda"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 	schedulermetrics "k8s.io/kubernetes/pkg/scheduler/metrics"
@@ -28,7 +29,8 @@ type response struct {
 }
 
 type app struct {
-	scheduler *schedulerpkg.Scheduler
+	scheduler            *schedulerpkg.Scheduler
+	maxPodsPerInvocation int
 }
 
 // Global singleton for this execution environment.
@@ -45,6 +47,18 @@ func getDuration(name string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+func getInt(name string, def int) int {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
 }
 
 func newApp(ctx context.Context) (*app, error) {
@@ -97,14 +111,14 @@ func newApp(ctx context.Context) (*app, error) {
 
 	cacheMapStore := awsstore.NewDynamoMapStore(cacheMapEnv)
 
-	binderFunctionName := os.Getenv("BINDER_FUNCTION_NAME")
-	if binderFunctionName == "" {
-		return nil, fmt.Errorf("BINDER_FUNCTION_NAME is not set")
+	binderQueueURL := os.Getenv("BINDER_QUEUE_URL")
+	if binderQueueURL == "" {
+		return nil, fmt.Errorf("BINDER_QUEUE_URL is not set")
 	}
 
-	binderInvoker := schedulerpkg.NewLambdaBinderInvoker(
-		awslambda.NewFromConfig(awsCfg),
-		binderFunctionName,
+	binderInvoker := schedulerpkg.NewSQSBinderInvoker(
+		sqs.NewFromConfig(awsCfg),
+		binderQueueURL,
 	)
 
 	sched, err := schedulerpkg.New(
@@ -119,7 +133,10 @@ func newApp(ctx context.Context) (*app, error) {
 		return nil, fmt.Errorf("create scheduler: %w", err)
 	}
 
-	return &app{scheduler: sched}, nil
+	return &app{
+		scheduler:            sched,
+		maxPodsPerInvocation: getInt("SCHEDULE_ONE_MAX_PODS", 25),
+	}, nil
 }
 
 func init() {
@@ -141,9 +158,10 @@ func handler(ctx context.Context) (response, error) {
 	defer klog.Flush()
 
 	logger := klog.FromContext(ctx)
-	logger.Info("Starting ScheduleOne lambda invocation")
-	appInst.scheduler.ScheduleOne(ctx)
-	logger.Info("Completed ScheduleOne lambda invocation")
+	maxPods := appInst.maxPodsPerInvocation
+	logger.Info("Starting ScheduleOne lambda invocation", "maxPods", maxPods)
+	processed := appInst.scheduler.ScheduleUpTo(ctx, maxPods)
+	logger.Info("Completed ScheduleOne lambda invocation", "processedPods", processed, "maxPods", maxPods)
 	return response{Processed: true}, nil
 }
 

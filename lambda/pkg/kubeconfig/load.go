@@ -4,12 +4,21 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+)
+
+// defaultKubeAPIQPS / defaultKubeAPIBurst override client-go's 5/10 defaults
+// so the no-watch Lambda components don't throttle their own per-reconcile
+// API traffic. Override at runtime via KUBE_API_QPS / KUBE_API_BURST.
+const (
+	defaultKubeAPIQPS   float32 = 200
+	defaultKubeAPIBurst int     = 400
 )
 
 // Load returns an out-of-cluster kubeconfig when one is explicitly provided
@@ -20,6 +29,7 @@ func Load() (*rest.Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("build kubeconfig from KUBECONFIG_PATH=%q: %w", path, err)
 		}
+		applyClientLimits(cfg)
 		return cfg, nil
 	}
 
@@ -28,6 +38,7 @@ func Load() (*rest.Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("build kubeconfig from KUBECONFIG_PARAMETER_NAME=%q: %w", parameterName, err)
 		}
+		applyClientLimits(cfg)
 		return cfg, nil
 	}
 
@@ -36,6 +47,7 @@ func Load() (*rest.Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("build kubeconfig from KUBECONFIG_PARAMETER_PREFIX=%q: %w", parameterPrefix, err)
 		}
+		applyClientLimits(cfg)
 		return cfg, nil
 	}
 
@@ -44,6 +56,7 @@ func Load() (*rest.Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("build kubeconfig from KUBECONFIG=%q: %w", path, err)
 		}
+		applyClientLimits(cfg)
 		return cfg, nil
 	}
 
@@ -55,7 +68,37 @@ func Load() (*rest.Config, error) {
 		)
 	}
 
+	applyClientLimits(cfg)
 	return cfg, nil
+}
+
+func applyClientLimits(cfg *rest.Config) {
+	cfg.QPS = envFloat32("KUBE_API_QPS", defaultKubeAPIQPS)
+	cfg.Burst = envInt("KUBE_API_BURST", defaultKubeAPIBurst)
+}
+
+func envFloat32(name string, def float32) float32 {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 32)
+	if err != nil || f <= 0 {
+		return def
+	}
+	return float32(f)
+}
+
+func envInt(name string, def int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
 }
 
 func loadFromParameter(ctx context.Context, parameterName string) (*rest.Config, error) {

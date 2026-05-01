@@ -69,14 +69,14 @@ func Run(ctx context.Context) {
 type lazyProxy struct {
 	baseCtx context.Context
 	mu      sync.Mutex
-	adapter *httpadapter.HandlerAdapter
+	adapter *httpadapter.HandlerAdapterV2
 }
 
-func (p *lazyProxy) ProxyWithContext(ctx context.Context, event events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+func (p *lazyProxy) ProxyWithContext(ctx context.Context, event events.APIGatewayV2HTTPRequest) (events.APIGatewayV2HTTPResponse, error) {
 	adapter, err := p.adapterFor(ctx)
 	if err != nil {
 		log.Printf("failed to build handler: %v", err)
-		return events.APIGatewayProxyResponse{
+		return events.APIGatewayV2HTTPResponse{
 			StatusCode: 500,
 			Headers: map[string]string{
 				"Content-Type": "text/plain; charset=utf-8",
@@ -87,7 +87,7 @@ func (p *lazyProxy) ProxyWithContext(ctx context.Context, event events.APIGatewa
 	return adapter.ProxyWithContext(ctx, event)
 }
 
-func (p *lazyProxy) adapterFor(ctx context.Context) (*httpadapter.HandlerAdapter, error) {
+func (p *lazyProxy) adapterFor(ctx context.Context) (*httpadapter.HandlerAdapterV2, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -103,7 +103,7 @@ func (p *lazyProxy) adapterFor(ctx context.Context) (*httpadapter.HandlerAdapter
 	if err != nil {
 		return nil, err
 	}
-	p.adapter = httpadapter.New(handler)
+	p.adapter = httpadapter.NewV2(handler)
 	return p.adapter, nil
 }
 

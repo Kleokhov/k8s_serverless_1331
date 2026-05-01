@@ -12,18 +12,20 @@ RUN_ID="${RUN_ID:-$(date -u +%Y%m%d%H%M%S)}"
 APP_LABEL="${APP_LABEL:-normal-workload}"
 RUN_LABEL="${RUN_LABEL:-${JOB_BASENAME}-${RUN_ID}}"
 TEST_DURATION_SECONDS="${TEST_DURATION_SECONDS:-3600}"
-SUBMISSION_INTERVAL_SECONDS="${SUBMISSION_INTERVAL_SECONDS:-30}"
+SUBMISSION_INTERVAL_SECONDS="${SUBMISSION_INTERVAL_SECONDS:-15}"
 JOBS_PER_INTERVAL="${JOBS_PER_INTERVAL:-1}"
-WORK_ITEMS="${WORK_ITEMS:-4000}"
-WORKLOAD_SLEEP_SECONDS="${WORKLOAD_SLEEP_SECONDS:-20}"
-POD_CPU_REQUEST="${POD_CPU_REQUEST:-150m}"
-POD_MEMORY_REQUEST="${POD_MEMORY_REQUEST:-128Mi}"
-JOB_TTL_SECONDS="${JOB_TTL_SECONDS:-300}"
+JOB_COMPLETIONS="${JOB_COMPLETIONS:-4}"
+JOB_PARALLELISM="${JOB_PARALLELISM:-4}"
+WORK_ITEMS="${WORK_ITEMS:-8000}"
+WORKLOAD_SLEEP_SECONDS="${WORKLOAD_SLEEP_SECONDS:-45}"
+POD_CPU_REQUEST="${POD_CPU_REQUEST:-50m}"
+POD_MEMORY_REQUEST="${POD_MEMORY_REQUEST:-64Mi}"
+JOB_TTL_SECONDS="${JOB_TTL_SECONDS:-600}"
 WAIT_FOR_COMPLETION="${WAIT_FOR_COMPLETION:-false}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-90m}"
 CLEANUP="${CLEANUP:-false}"
 MEASURE_COST="${MEASURE_COST:-true}"
-MEASURE_COST_TAIL_SECONDS="${MEASURE_COST_TAIL_SECONDS:-60}"
+MEASURE_COST_TAIL_SECONDS="${MEASURE_COST_TAIL_SECONDS:-120}"
 MEASURE_COST_DELAY_SECONDS="${MEASURE_COST_DELAY_SECONDS:-600}"
 MEASURE_COST_REGION="${MEASURE_COST_REGION:-${AWS_REGION:-us-east-1}}"
 MEASURE_COST_SCRIPT="${MEASURE_COST_SCRIPT:-${SCRIPT_DIR}/measure_cost.py}"
@@ -37,38 +39,41 @@ usage() {
   cat <<'EOF_USAGE'
 Usage: ./scripts/test/test_schedule_minutely.sh
 
-Runs a steady, low-rate Job workload against the serverless pipeline for one
-hour and then computes the AWS cost incurred over that window via
-measure_cost.py. The shape of the workload is meant to imitate a normal
-batch/CI-style usage pattern, not a stress test:
+Runs a steady Job workload against the serverless pipeline for one hour and
+then computes the AWS cost incurred over that window via measure_cost.py. The
+shape of the workload is meant to imitate a realistic parallel batch tenant
+with moderate control-plane pressure, not a pure stress test:
 
-  - One Job is submitted every SUBMISSION_INTERVAL_SECONDS (default 30s).
-  - Each Job runs a small sort-and-checksum workload, then sleeps
-    WORKLOAD_SLEEP_SECONDS, so a single Job lasts on the order of seconds.
-  - At any given time only a handful of pods are inflight, which is what a
-    realistic batch tenant looks like.
+  - One Job is submitted every SUBMISSION_INTERVAL_SECONDS (default 15s).
+  - Each Job creates JOB_COMPLETIONS pods and runs up to JOB_PARALLELISM pods
+    concurrently (defaults: 4 completions, 4 parallelism).
+  - Each pod runs a small sort-and-checksum workload, then sleeps
+    WORKLOAD_SLEEP_SECONDS, so each pod lasts long enough to observe scheduling,
+    status updates, completion, and TTL cleanup.
   - The namespace is created once and reused; no rotation, no cascade-delete
-    churn.
+    churn during the measured workload.
   - Finished Jobs are reaped JOB_TTL_SECONDS after completion.
 
-Defaults (1h run, one Job every 30s) submit ~120 Jobs total. Tune the cadence
-or per-Job duration if you want to model a different tenant.
+Defaults submit ~240 Jobs/hour and ~960 Pods/hour, with roughly a dozen pods
+in flight at steady state when pods live for about 45s.
 
 Environment overrides:
   NS=hello-test
   TEST_DURATION_SECONDS=3600
-  SUBMISSION_INTERVAL_SECONDS=30
+  SUBMISSION_INTERVAL_SECONDS=15
   JOBS_PER_INTERVAL=1
-  WORK_ITEMS=4000
-  WORKLOAD_SLEEP_SECONDS=20
-  POD_CPU_REQUEST=150m
-  POD_MEMORY_REQUEST=128Mi
-  JOB_TTL_SECONDS=300
+  JOB_COMPLETIONS=4
+  JOB_PARALLELISM=4
+  WORK_ITEMS=8000
+  WORKLOAD_SLEEP_SECONDS=45
+  POD_CPU_REQUEST=50m
+  POD_MEMORY_REQUEST=64Mi
+  JOB_TTL_SECONDS=600
   WAIT_FOR_COMPLETION=false
   WAIT_TIMEOUT=90m
   CLEANUP=false
   MEASURE_COST=true
-  MEASURE_COST_TAIL_SECONDS=60
+  MEASURE_COST_TAIL_SECONDS=120
   MEASURE_COST_DELAY_SECONDS=600       (CloudWatch AWS/Logs lags ~10m)
   MEASURE_COST_REGION=us-east-1
   MEASURE_COST_EXTRA_ARGS=""
@@ -181,8 +186,8 @@ metadata:
     app: ${APP_LABEL}
     run: ${RUN_LABEL}
 spec:
-  completions: 1
-  parallelism: 1
+  completions: ${JOB_COMPLETIONS}
+  parallelism: ${JOB_PARALLELISM}
   backoffLimit: 0
   ttlSecondsAfterFinished: ${JOB_TTL_SECONDS}
   template:
@@ -215,15 +220,15 @@ spec:
           sort -n "\${workdir}/numbers.txt" > "\${workdir}/numbers.sorted.txt"
           awk 'BEGIN { sum = 0 }
             {
-              sum += $1
-              if (NR == 1 || $1 < min) { min = $1 }
-              if (NR == 1 || $1 > max) { max = $1 }
+              sum += \$1
+              if (NR == 1 || \$1 < min) { min = \$1 }
+              if (NR == 1 || \$1 > max) { max = \$1 }
             }
             END {
               printf "count=%d\nsum=%d\nmin=%d\nmax=%d\n", NR, sum, min, max
             }' "\${workdir}/numbers.sorted.txt" > "\${workdir}/summary.txt"
           cksum "\${workdir}/numbers.sorted.txt" >> "\${workdir}/summary.txt"
-          echo "job_index=\${job_index} pod_name=$(hostname) started_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          echo "job_index=\${job_index} pod_name=\$(hostname) started_at=\$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           cat "\${workdir}/summary.txt"
           sleep "\${workload_sleep_seconds}"
         resources:
@@ -260,6 +265,8 @@ fi
 require_positive_integer "TEST_DURATION_SECONDS" "${TEST_DURATION_SECONDS}"
 require_positive_integer "SUBMISSION_INTERVAL_SECONDS" "${SUBMISSION_INTERVAL_SECONDS}"
 require_positive_integer "JOBS_PER_INTERVAL" "${JOBS_PER_INTERVAL}"
+require_positive_integer "JOB_COMPLETIONS" "${JOB_COMPLETIONS}"
+require_positive_integer "JOB_PARALLELISM" "${JOB_PARALLELISM}"
 require_positive_integer "WORK_ITEMS" "${WORK_ITEMS}"
 require_non_negative_integer "WORKLOAD_SLEEP_SECONDS" "${WORKLOAD_SLEEP_SECONDS}"
 require_positive_integer "JOB_TTL_SECONDS" "${JOB_TTL_SECONDS}"
@@ -292,17 +299,22 @@ START_ISO="$(date -u -d "@${start_epoch}" '+%Y-%m-%dT%H:%M:%SZ')"
 submitted_jobs=0
 iteration=0
 
+expected_intervals=$(( (TEST_DURATION_SECONDS + SUBMISSION_INTERVAL_SECONDS - 1) / SUBMISSION_INTERVAL_SECONDS ))
+expected_jobs=$(( expected_intervals * JOBS_PER_INTERVAL ))
+expected_pods=$(( expected_jobs * JOB_COMPLETIONS ))
+steady_state_pods=$(( ((WORKLOAD_SLEEP_SECONDS + SUBMISSION_INTERVAL_SECONDS - 1) / SUBMISSION_INTERVAL_SECONDS) * JOBS_PER_INTERVAL * JOB_PARALLELISM ))
+
 echo "[*] Ensuring namespace ${NS} exists"
 kubectl create namespace "${NS}" --dry-run=client -o yaml | kubectl_apply_retry -f -
-
-expected_jobs=$(( (TEST_DURATION_SECONDS / SUBMISSION_INTERVAL_SECONDS) * JOBS_PER_INTERVAL ))
 
 echo "[*] Starting steady-state workload run"
 echo "[*] Namespace: ${NS}"
 echo "[*] Selector: ${JOB_SELECTOR}"
 echo "[*] Duration: ${TEST_DURATION_SECONDS}s"
 echo "[*] Submission interval: ${SUBMISSION_INTERVAL_SECONDS}s (${JOBS_PER_INTERVAL} job(s) per interval, ~${expected_jobs} jobs total)"
-echo "[*] Per-job pods: completions=1 parallelism=1"
+echo "[*] Per-job pods: completions=${JOB_COMPLETIONS} parallelism=${JOB_PARALLELISM} (~${JOB_COMPLETIONS} pod(s) per completed job)"
+echo "[*] Expected pod creations: ~${expected_pods} total"
+echo "[*] Estimated steady-state active pods: ~${steady_state_pods}"
 echo "[*] Workload: generate ${WORK_ITEMS} numbers, sort, summarize, sleep ${WORKLOAD_SLEEP_SECONDS}s"
 echo "[*] Job ttlSecondsAfterFinished: ${JOB_TTL_SECONDS}s"
 
@@ -333,6 +345,7 @@ done
 echo
 echo "[*] Finished submission loop after ${TEST_DURATION_SECONDS}s"
 echo "[*] Submitted ${submitted_jobs} jobs total"
+echo "[*] Expected pod creations from submitted jobs: $((submitted_jobs * JOB_COMPLETIONS))"
 print_status
 
 if [[ "${WAIT_FOR_COMPLETION}" == "true" ]]; then

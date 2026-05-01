@@ -23,6 +23,7 @@ Environment knobs:
   KUBECONFIG_PARAMETER_NAME   SSM parameter containing the full kubeconfig
   SCHEDULER_ATTACH_TO_VPC     true|false, default false
   SCHEDULER_ARTIFACT_BUCKET   S3 bucket for scheduler/controller SAM artifacts
+  SCHEDULE_ONE_MAX_PODS       Pods to drain per schedule-one invocation (default: 25)
 EOF
 }
 
@@ -73,6 +74,9 @@ CLUSTER_VPC_ID="${CLUSTER_VPC_ID:-}"
 CLUSTER_SUBNET_IDS="${CLUSTER_SUBNET_IDS:-}"
 CLUSTER_SECURITY_GROUP_ID="${CLUSTER_SECURITY_GROUP_ID:-}"
 CLUSTER_ROUTE_TABLE_IDS="${CLUSTER_ROUTE_TABLE_IDS:-}"
+
+POD_MAX_UNSCHEDULABLE_AGE="${POD_MAX_UNSCHEDULABLE_AGE:-10s}"
+SCHEDULE_ONE_MAX_PODS="${SCHEDULE_ONE_MAX_PODS:-25}"
 
 default_artifact_bucket_name() {
   local component="$1"
@@ -291,6 +295,8 @@ param_overrides=(
   "AttachToVpc=${SCHEDULER_ATTACH_TO_VPC}"
   "CreateVpcEndpoints=${CREATE_VPC_ENDPOINTS}"
   "KubeconfigParameterName=${KUBECONFIG_PARAMETER_NAME}"
+  "PodMaxUnschedulableAge=${POD_MAX_UNSCHEDULABLE_AGE}"
+  "ScheduleOneMaxPodsPerInvocation=${SCHEDULE_ONE_MAX_PODS}"
 )
 if [[ "${SCHEDULER_ATTACH_TO_VPC}" == "true" ]]; then
   param_overrides+=(

@@ -6,6 +6,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
 
 	"lambda/pkg/scheduler/backend/awsstore"
@@ -106,6 +107,7 @@ func buildPriorityQueue(
 		stop:                              make(chan struct{}),
 		podMaxInUnschedulablePodsDuration: options.podMaxInUnschedulablePodsDuration,
 		moveRequestCycle:                  -1,
+		nsLabelsCache:                     make(map[string]labels.Set),
 	}
 
 	if parts.activeQ != nil {

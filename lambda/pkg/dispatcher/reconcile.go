@@ -73,6 +73,7 @@ type reconcileRun struct {
 	deletedPodStates        map[string]struct{}
 	deletedAssumedKeys      map[string]struct{}
 	nodePodDeltas           map[string]*nodePodDelta
+	nodePodOps              map[string]*nodePodPersistOps
 	dirtyDispatchJobs       map[string]*awsstore.DispatchJobState
 	deletedDispatchJobs     map[string]struct{}
 	dirtyDispatchPods       map[string]*awsstore.DispatchPodState
@@ -203,6 +204,12 @@ func Reconcile(
 ) (Result, error) {
 	logger.Info("Starting dispatcher reconcile loop")
 
+	// The scheduling queue is shared across warm Lambda invocations, so its
+	// per-invocation namespace label cache must be cleared at the start of
+	// every reconcile. Without this the cache would be effectively process-
+	// scoped and serve stale labels.
+	q.ResetNamespaceLabelsCache()
+
 	state, err := fetchAll(ctx, client, cacheStore, dispatchStore, q)
 	if err != nil {
 		return Result{}, err
@@ -282,6 +289,7 @@ func newReconcileRun(
 		deletedPodStates:        make(map[string]struct{}),
 		deletedAssumedKeys:      make(map[string]struct{}),
 		nodePodDeltas:           make(map[string]*nodePodDelta),
+		nodePodOps:              make(map[string]*nodePodPersistOps),
 		dirtyDispatchJobs:       make(map[string]*awsstore.DispatchJobState),
 		deletedDispatchJobs:     make(map[string]struct{}),
 		dirtyDispatchPods:       make(map[string]*awsstore.DispatchPodState),
@@ -426,58 +434,54 @@ func (r *reconcileRun) reconcileScheduledPods() {
 
 func (r *reconcileRun) applyNodePodDeltas() {
 	for nodeName, delta := range r.nodePodDeltas {
+		// Nodes that are being deleted will have all their per-pod records
+		// purged by DeleteNode in persist(); skip emitting individual pod ops.
+		if _, deleted := r.deletedNodes[nodeName]; deleted {
+			continue
+		}
+
 		rec, ok := r.state.dbNodes[nodeName]
 		if !ok || rec == nil {
 			continue
 		}
 
-		for _, repl := range delta.replace {
-			if err := rec.ReplacePod(repl.oldPod, repl.newPod); err != nil {
-				r.logger.V(4).Info(
-					"Pod not found in node record during replace; falling back to remove/add",
-					"pod", klog.KObj(repl.newPod),
-					"node", nodeName,
-				)
+		ops := r.getNodePodOps(nodeName)
 
-				if err := rec.RemovePod(repl.oldPod); err != nil {
-					r.logger.V(4).Info(
-						"Pod not found in node record during remove fallback",
-						"pod", klog.KObj(repl.oldPod),
-						"node", nodeName,
-					)
-				}
-				if err := rec.AddPod(repl.newPod); err != nil {
-					r.logger.V(4).Info(
-						"Pod already present in node record during add fallback",
-						"pod", klog.KObj(repl.newPod),
-						"node", nodeName,
-					)
-				}
-			}
+		// Per-pod items are keyed by pod UID, so a "replace" of the same pod
+		// (same UID, new ResourceVersion) is just an upsert that overwrites
+		// the prior payload.
+		for _, repl := range delta.replace {
+			ops.upsert = append(ops.upsert, repl.newPod)
 		}
 
 		for _, pod := range delta.del {
-			if err := rec.RemovePod(pod); err != nil {
-				r.logger.V(4).Info(
-					"Pod not found in node record during remove",
-					"pod", klog.KObj(pod),
-					"node", nodeName,
-				)
+			key, err := framework.GetPodKey(pod)
+			if err != nil {
+				r.logger.Error(err, "Failed to get pod key for node delta delete", "pod", klog.KObj(pod), "node", nodeName)
+				continue
 			}
+			ops.delete = append(ops.delete, key)
 		}
 
 		for _, pod := range delta.add {
-			if err := rec.AddPod(pod); err != nil {
-				r.logger.V(4).Info(
-					"Pod already present in node record during add",
-					"pod", klog.KObj(pod),
-					"node", nodeName,
-				)
-			}
+			ops.upsert = append(ops.upsert, pod)
 		}
 
+		// Bump the node-meta generation so consumers calling ListNodes /
+		// UpdateSnapshot observe a fresh version after the pod set changes.
+		rec.Generation++
+		rec.UpdatedAt = r.now
 		r.dirtyNodes[nodeName] = rec
 	}
+}
+
+func (r *reconcileRun) getNodePodOps(nodeName string) *nodePodPersistOps {
+	ops, ok := r.nodePodOps[nodeName]
+	if !ok {
+		ops = &nodePodPersistOps{}
+		r.nodePodOps[nodeName] = ops
+	}
+	return ops
 }
 
 func (r *reconcileRun) reconcileUnscheduledPods() {
@@ -542,8 +546,25 @@ func (r *reconcileRun) persist(ctx context.Context) error {
 	for name, rec := range r.dirtyNodes {
 		name, rec := name, rec
 		writeGroup.Go(func() error {
-			if err := r.cacheStore.UpsertNode(writeCtx, name, rec); err != nil {
-				return fmt.Errorf("upsert node %s: %w", name, err)
+			if err := r.cacheStore.UpsertNodeMeta(writeCtx, name, rec); err != nil {
+				return fmt.Errorf("upsert node meta %s: %w", name, err)
+			}
+			return nil
+		})
+	}
+
+	for nodeName, ops := range r.nodePodOps {
+		nodeName, ops := nodeName, ops
+		writeGroup.Go(func() error {
+			for _, pod := range ops.upsert {
+				if err := r.cacheStore.AddNodePod(writeCtx, nodeName, pod); err != nil {
+					return fmt.Errorf("upsert pod on node %s: %w", nodeName, err)
+				}
+			}
+			for _, key := range ops.delete {
+				if _, err := r.cacheStore.RemoveNodePod(writeCtx, nodeName, key); err != nil {
+					return fmt.Errorf("remove pod %s on node %s: %w", key, nodeName, err)
+				}
 			}
 			return nil
 		})

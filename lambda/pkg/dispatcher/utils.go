@@ -41,6 +41,16 @@ type nodePodDelta struct {
 	replace []nodePodReplace
 }
 
+// nodePodPersistOps captures the per-node pod-item writes that need to be
+// applied to DynamoDB during persist(). Because pods are now stored as
+// individual items (one per pod, keyed by UID, under CACHE#NODEPOD#<nodeName>),
+// the reconciler emits explicit upserts and deletes rather than rewriting the
+// node record as a single blob.
+type nodePodPersistOps struct {
+	upsert []*corev1.Pod
+	delete []string
+}
+
 func hasNominatedNodeNameChanged(oldPod, newPod *corev1.Pod) bool {
 	return len(oldPod.Status.NominatedNodeName) > 0 &&
 		oldPod.Status.NominatedNodeName != newPod.Status.NominatedNodeName

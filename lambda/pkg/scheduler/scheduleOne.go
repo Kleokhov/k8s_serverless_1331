@@ -61,21 +61,76 @@ const (
 	numberOfHighestScoredNodesToReport = 3
 )
 
+type scheduleOneOutcome struct {
+	consumed bool
+	binding  *pendingBindingDispatch
+}
+
 // ScheduleOne does the entire scheduling workflow for a single pod. It is serialized on the scheduling algorithm's host fitting.
 func (sched *Scheduler) ScheduleOne(ctx context.Context) {
+	outcome := sched.scheduleOne(ctx)
+	if outcome.binding != nil {
+		if err := sched.dispatchBinding(ctx, outcome.binding.req); err != nil {
+			sched.handleBindingDispatchError(ctx, outcome.binding.fwk, outcome.binding.podInfo, outcome.binding.start, err)
+		}
+	}
+}
+
+// ScheduleUpTo drains up to maxPods from the scheduling queue in one caller
+// invocation. It stops early when the queue is empty or the context is done.
+func (sched *Scheduler) ScheduleUpTo(ctx context.Context, maxPods int) int {
+	if maxPods <= 0 {
+		return 0
+	}
+
+	processed := 0
+	pendingBindings := make([]pendingBindingDispatch, 0, min(maxPods, 10))
+	flushBindings := func() {
+		if len(pendingBindings) == 0 {
+			return
+		}
+		sched.dispatchBindingBatch(ctx, pendingBindings)
+		pendingBindings = pendingBindings[:0]
+	}
+
+	for processed < maxPods {
+		if err := ctx.Err(); err != nil {
+			klog.FromContext(ctx).Error(err, "Stopping schedule drain because context is done", "processedPods", processed, "maxPods", maxPods)
+			break
+		}
+		outcome := sched.scheduleOne(ctx)
+		if !outcome.consumed {
+			break
+		}
+		processed++
+		if outcome.binding != nil {
+			pendingBindings = append(pendingBindings, *outcome.binding)
+			if len(pendingBindings) >= 10 {
+				flushBindings()
+			}
+		}
+	}
+	flushBindings()
+	return processed
+}
+
+// scheduleOne reports whether it consumed a pod from the queue, even if that
+// pod later failed scheduling. Successful scheduling returns a pending binding
+// handoff for the caller to dispatch.
+func (sched *Scheduler) scheduleOne(ctx context.Context) scheduleOneOutcome {
 	logger := klog.FromContext(ctx)
 	podInfo, err := sched.NextPod(logger)
 	if err != nil {
 		if errors.Is(err, awsstore.ErrQueueEmpty) {
 			logger.V(4).Info("Scheduling queue is empty")
-			return
+			return scheduleOneOutcome{}
 		}
 		logger.Error(err, "Error while retrieving next pod from scheduling queue")
-		return
+		return scheduleOneOutcome{}
 	}
 	// pod could be nil when schedulerQueue is closed
 	if podInfo == nil || podInfo.Pod == nil {
-		return
+		return scheduleOneOutcome{}
 	}
 
 	pod := podInfo.Pod
@@ -89,12 +144,12 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 		// which specify a scheduler name that matches one of the profiles.
 		logger.Error(err, "Error occurred")
 		sched.SchedulingQueue.Done(pod.UID)
-		return
+		return scheduleOneOutcome{consumed: true}
 	}
 	if sched.skipPodSchedule(ctx, fwk, pod) {
 		// We don't put this Pod back to the queue, but we have to cleanup the in-flight pods/events.
 		sched.SchedulingQueue.Done(pod.UID)
-		return
+		return scheduleOneOutcome{consumed: true}
 	}
 
 	logger.V(3).Info("Attempting to schedule pod", "pod", klog.KObj(pod))
@@ -118,7 +173,7 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 	scheduleResult, assumedPodInfo, status := sched.schedulingCycle(schedulingCycleCtx, state, fwk, podInfo, start, podsToActivate)
 	if !status.IsSuccess() {
 		sched.FailureHandler(schedulingCycleCtx, fwk, assumedPodInfo, status, scheduleResult.nominatingInfo, start)
-		return
+		return scheduleOneOutcome{consumed: true}
 	}
 
 	logger.Info(
@@ -129,8 +184,14 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 		"attempts", assumedPodInfo.Attempts,
 	)
 
-	if err := sched.dispatchBinding(ctx, newBindingRequest(scheduleResult, assumedPodInfo, start)); err != nil {
-		sched.handleBindingDispatchError(ctx, fwk, assumedPodInfo, start, err)
+	return scheduleOneOutcome{
+		consumed: true,
+		binding: &pendingBindingDispatch{
+			req:     newBindingRequest(scheduleResult, assumedPodInfo, start),
+			fwk:     fwk,
+			podInfo: assumedPodInfo,
+			start:   start,
+		},
 	}
 }
 

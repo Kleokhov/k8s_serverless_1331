@@ -120,7 +120,9 @@ func (bq *BackoffQueuesAWS) Add(ctx context.Context, pInfo *framework.QueuedPodI
 			"#pk": AttrPK,
 			"#sk": AttrSK,
 		}
-		exprVals := map[string]dbtypes.AttributeValue{}
+		// DynamoDB rejects an empty (non-nil) ExpressionAttributeValues map; leave
+		// it nil unless the conditional expression actually references values.
+		var exprVals map[string]dbtypes.AttributeValue
 
 		if found {
 			version = cur.Version + 1

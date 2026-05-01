@@ -56,7 +56,7 @@ Parameters:
   # Dispatcher self-chain
   DispatcherSelfTriggerInterval:
     Type: String
-    Default: 15s
+    Default: 5s
     Description: Target period between dispatcher invocations via SQS self-chain.
   # Scheduler
   PodInitialBackoff:
@@ -67,11 +67,15 @@ Parameters:
     Default: 10s
   PodMaxUnschedulableAge:
     Type: String
-    Default: 5m
+    Default: 10s
+  ScheduleOneMaxPodsPerInvocation:
+    Type: Number
+    Default: 25
+    Description: Maximum number of pods a ScheduleOne Lambda invocation will drain before returning.
   # PodGC
   PodGcTerminatedThreshold:
     Type: Number
-    Default: 100
+    Default: 10000
   PodGcRunOnceIterations:
     Type: Number
     Default: 1
@@ -250,6 +254,24 @@ Resources:
         - Key: Stack
           Value: !Ref ResourcePrefix
 
+  # Standard (non-FIFO) queue: bind ordering is irrelevant across pods, and
+  # the binder Lambda processes records in parallel goroutines per invocation.
+  # MessageRetentionPeriod is short because bind decisions are time-sensitive
+  # and re-driving a stale assumed pod is worse than dropping it.
+  BinderQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ResourcePrefix}-binder"
+      VisibilityTimeout: 120
+      MessageRetentionPeriod: 300
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTagValue
+        - Key: Environment
+          Value: !Ref EnvironmentTagValue
+        - Key: Stack
+          Value: !Ref ResourcePrefix
+
   JobQueue:
     Type: AWS::SQS::Queue
     Properties:
@@ -394,14 +416,15 @@ Resources:
           Properties:
             Stream: !GetAtt ActiveQueueTable.StreamArn
             StartingPosition: LATEST
-            BatchSize: 1
+            BatchSize: !Ref ScheduleOneMaxPodsPerInvocation
             Enabled: true
             FilterCriteria:
               Filters:
                 - Pattern: '{"eventName":["INSERT","MODIFY"]}'
       Environment:
         Variables:
-          BINDER_FUNCTION_NAME: !Ref BinderFunction
+          BINDER_QUEUE_URL: !Ref BinderQueue
+          SCHEDULE_ONE_MAX_PODS: !Ref ScheduleOneMaxPodsPerInvocation
       Policies:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
         - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
@@ -421,13 +444,13 @@ Resources:
         - DynamoDBCrudPolicy:
             TableName: !Ref BackoffQueueTable
         - Statement:
-            - Sid: InvokeBinderLambda
+            - Sid: BinderQueueSend
               Effect: Allow
               Action:
-                - lambda:InvokeFunction
-              Resource:
-                - !GetAtt BinderFunction.Arn
-                - !Sub "${BinderFunction.Arn}:*"
+                - sqs:SendMessage
+                - sqs:GetQueueAttributes
+                - sqs:GetQueueUrl
+              Resource: !GetAtt BinderQueue.Arn
 
   BinderFunction:
     Type: AWS::Serverless::Function
@@ -437,6 +460,19 @@ Resources:
       FunctionName: !Sub "${ResourcePrefix}-binder"
       Tags:
         LambdaCostGroup: scheduler
+      Timeout: 60
+      Events:
+        BinderQueueTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt BinderQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+            Enabled: true
+      Environment:
+        Variables:
+          BINDER_QUEUE_URL: !Ref BinderQueue
       Policies:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
         - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
@@ -455,6 +491,16 @@ Resources:
             TableName: !Ref ActiveQueueTable
         - DynamoDBCrudPolicy:
             TableName: !Ref BackoffQueueTable
+        - Statement:
+            - Sid: BinderQueueAccess
+              Effect: Allow
+              Action:
+                - sqs:ChangeMessageVisibility
+                - sqs:DeleteMessage
+                - sqs:GetQueueAttributes
+                - sqs:GetQueueUrl
+                - sqs:ReceiveMessage
+              Resource: !GetAtt BinderQueue.Arn
 
   BackoffFlushFunction:
     Type: AWS::Serverless::Function
@@ -716,25 +762,6 @@ Resources:
       VpcEndpointType: Interface
       VpcId: !Ref ClusterVpcId
       ServiceName: !Sub "com.amazonaws.${AWS::Region}.lambda"
-      PrivateDnsEnabled: true
-      SecurityGroupIds:
-        - !Ref ClusterSecurityGroupId
-      SubnetIds: !Split [",", !Ref ClusterSubnetIds]
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectTagValue
-        - Key: Environment
-          Value: !Ref EnvironmentTagValue
-        - Key: Stack
-          Value: !Ref ResourcePrefix
-
-  ExecuteApiVpcEndpoint:
-    Type: AWS::EC2::VPCEndpoint
-    Condition: ShouldCreateVpcEndpoints
-    Properties:
-      VpcEndpointType: Interface
-      VpcId: !Ref ClusterVpcId
-      ServiceName: !Sub "com.amazonaws.${AWS::Region}.execute-api"
       PrivateDnsEnabled: true
       SecurityGroupIds:
         - !Ref ClusterSecurityGroupId

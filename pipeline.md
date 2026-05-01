@@ -246,3 +246,12 @@ For serverful:
 ```
 export KUBECONFIG="$HOME/CTRLLess/k8s_serverless_1331/_ec2_out/admin.public.conf"
 ```
+
+```
+sam logs --stack-name ctrlless-serverless-lambda --region us-east-1 -t > log.txt
+sam logs --stack-name ctrlless-serverless-lambda --region us-east-1 --name ScheduleOneFunction -t > log_scheduleOne.txt
+```
+
+```
+kubectl delete pods --all -n latency-test
+```

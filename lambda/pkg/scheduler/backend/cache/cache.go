@@ -92,18 +92,34 @@ func (cache *cacheImpl) UpdateSnapshot(_ klog.Logger) (map[string]*framework.Nod
 	return snapshot, nil
 }
 
+func (cache *cacheImpl) GetNodeInfo(_ klog.Logger, nodeName string) (*framework.NodeInfo, bool, error) {
+	cache.mu.RLock()
+	defer cache.mu.RUnlock()
+
+	rec, found, _, err := cache.store.GetNode(context.Background(), nodeName)
+	if err != nil || !found {
+		return nil, found, err
+	}
+
+	nodeInfo := awsstore.RebuildNodeInfo(rec).Snapshot()
+	if nodeInfo == nil || nodeInfo.Node() == nil {
+		return nil, false, nil
+	}
+	return nodeInfo, true, nil
+}
+
 // NodeCount returns the number of nodes in the cache.
 func (cache *cacheImpl) NodeCount() int {
 	cache.mu.RLock()
 	defer cache.mu.RUnlock()
 
-	nodes, err := cache.store.ListNodes(context.Background())
+	metas, err := cache.store.ListNodeMeta(context.Background())
 	if err != nil {
 		return 0
 	}
 
 	count := 0
-	for _, rec := range nodes {
+	for _, rec := range metas {
 		if rec.Node != nil {
 			count++
 		}
@@ -116,13 +132,18 @@ func (cache *cacheImpl) PodCount() (int, error) {
 	cache.mu.RLock()
 	defer cache.mu.RUnlock()
 
-	nodes, err := cache.store.ListNodes(context.Background())
+	ctx := context.Background()
+	metas, err := cache.store.ListNodeMeta(ctx)
 	if err != nil {
 		return 0, err
 	}
 	count := 0
-	for _, rec := range nodes {
-		count += len(rec.Pods)
+	for name := range metas {
+		n, err := cache.store.CountNodePods(ctx, name)
+		if err != nil {
+			return 0, err
+		}
+		count += n
 	}
 	return count, nil
 }
@@ -230,19 +251,20 @@ func (cache *cacheImpl) addPod(logger klog.Logger, pod *v1.Pod, assumePod bool) 
 		return err
 	}
 
-	rec, found, _, err := cache.store.GetNode(ctx, pod.Spec.NodeName)
+	rec, found, _, err := cache.store.GetNodeMeta(ctx, pod.Spec.NodeName)
 	if err != nil {
 		return err
 	}
 	if !found {
 		rec = awsstore.NewNodeRecord()
 	}
-
-	if err := rec.AddPod(pod); err != nil {
+	rec.Generation++
+	rec.UpdatedAt = time.Now()
+	if err := cache.store.UpsertNodeMeta(ctx, pod.Spec.NodeName, rec); err != nil {
 		return err
 	}
 
-	if err := cache.store.UpsertNode(ctx, pod.Spec.NodeName, rec); err != nil {
+	if err := cache.store.AddNodePod(ctx, pod.Spec.NodeName, pod); err != nil {
 		return err
 	}
 
@@ -289,18 +311,26 @@ func (cache *cacheImpl) removePod(logger klog.Logger, pod *v1.Pod) error {
 		return err
 	}
 
-	rec, found, _, err := cache.store.GetNode(ctx, pod.Spec.NodeName)
+	rec, found, _, err := cache.store.GetNodeMeta(ctx, pod.Spec.NodeName)
 	if err != nil {
 		return err
 	}
 	if found {
-		if err := rec.RemovePod(pod); err != nil {
+		if _, err := cache.store.RemoveNodePod(ctx, pod.Spec.NodeName, key); err != nil {
 			return err
 		}
-		if len(rec.Pods) == 0 && rec.Node == nil {
-			_, _ = cache.store.DeleteNode(ctx, pod.Spec.NodeName)
+		remaining, err := cache.store.CountNodePods(ctx, pod.Spec.NodeName)
+		if err != nil {
+			return err
+		}
+		if remaining == 0 && rec.Node == nil {
+			if _, err := cache.store.DeleteNodeMeta(ctx, pod.Spec.NodeName); err != nil {
+				return err
+			}
 		} else {
-			if err := cache.store.UpsertNode(ctx, pod.Spec.NodeName, rec); err != nil {
+			rec.Generation++
+			rec.UpdatedAt = time.Now()
+			if err := cache.store.UpsertNodeMeta(ctx, pod.Spec.NodeName, rec); err != nil {
 				return err
 			}
 		}
@@ -464,7 +494,7 @@ func (cache *cacheImpl) AddNode(logger klog.Logger, node *v1.Node) *framework.No
 
 	ctx := context.Background()
 
-	rec, found, _, err := cache.store.GetNode(ctx, node.Name)
+	rec, found, _, err := cache.store.GetNodeMeta(ctx, node.Name)
 	if err != nil {
 		logger.Error(err, "Failed to get node from cache store", "node", klog.KObj(node))
 		return nil
@@ -476,7 +506,17 @@ func (cache *cacheImpl) AddNode(logger klog.Logger, node *v1.Node) *framework.No
 	rec.Generation++
 	rec.UpdatedAt = time.Now()
 
-	_ = cache.store.UpsertNode(ctx, node.Name, rec)
+	if err := cache.store.UpsertNodeMeta(ctx, node.Name, rec); err != nil {
+		logger.Error(err, "Failed to upsert node metadata", "node", klog.KObj(node))
+		return nil
+	}
+
+	pods, err := cache.store.ListNodePods(ctx, node.Name)
+	if err != nil {
+		logger.Error(err, "Failed to list pods on node", "node", klog.KObj(node))
+		return nil
+	}
+	rec.Pods = pods
 	return awsstore.RebuildNodeInfo(rec).Snapshot()
 }
 
@@ -486,7 +526,7 @@ func (cache *cacheImpl) UpdateNode(logger klog.Logger, oldNode, newNode *v1.Node
 
 	ctx := context.Background()
 
-	rec, found, _, err := cache.store.GetNode(ctx, oldNode.Name)
+	rec, found, _, err := cache.store.GetNodeMeta(ctx, oldNode.Name)
 	if err != nil {
 		logger.Error(err, "Failed to get node from cache store", "node", klog.KObj(oldNode))
 		return nil
@@ -498,7 +538,17 @@ func (cache *cacheImpl) UpdateNode(logger klog.Logger, oldNode, newNode *v1.Node
 	rec.Generation++
 	rec.UpdatedAt = time.Now()
 
-	_ = cache.store.UpsertNode(ctx, newNode.Name, rec)
+	if err := cache.store.UpsertNodeMeta(ctx, newNode.Name, rec); err != nil {
+		logger.Error(err, "Failed to upsert node metadata", "node", klog.KObj(newNode))
+		return nil
+	}
+
+	pods, err := cache.store.ListNodePods(ctx, newNode.Name)
+	if err != nil {
+		logger.Error(err, "Failed to list pods on node", "node", klog.KObj(newNode))
+		return nil
+	}
+	rec.Pods = pods
 	return awsstore.RebuildNodeInfo(rec).Snapshot()
 }
 
@@ -514,7 +564,7 @@ func (cache *cacheImpl) RemoveNode(logger klog.Logger, node *v1.Node) error {
 
 	ctx := context.Background()
 
-	rec, found, _, err := cache.store.GetNode(ctx, node.Name)
+	rec, found, _, err := cache.store.GetNodeMeta(ctx, node.Name)
 	if err != nil {
 		return err
 	}
@@ -526,9 +576,13 @@ func (cache *cacheImpl) RemoveNode(logger klog.Logger, node *v1.Node) error {
 	rec.Generation++
 	rec.UpdatedAt = time.Now()
 
-	if len(rec.Pods) == 0 {
-		_, err = cache.store.DeleteNode(ctx, node.Name)
+	podCount, err := cache.store.CountNodePods(ctx, node.Name)
+	if err != nil {
 		return err
 	}
-	return cache.store.UpsertNode(ctx, node.Name, rec)
+	if podCount == 0 {
+		_, err = cache.store.DeleteNodeMeta(ctx, node.Name)
+		return err
+	}
+	return cache.store.UpsertNodeMeta(ctx, node.Name, rec)
 }

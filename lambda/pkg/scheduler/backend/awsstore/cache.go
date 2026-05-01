@@ -10,10 +10,19 @@ import (
 )
 
 const (
-	cachePodStatePK = "CACHE#PODSTATE"
-	cacheAssumedPK  = "CACHE#ASSUMED"
-	cacheNodePK     = "CACHE#NODE"
+	cachePodStatePK    = "CACHE#PODSTATE"
+	cacheAssumedPK     = "CACHE#ASSUMED"
+	cacheNodePK        = "CACHE#NODE"
+	cacheNodePodPrefix = "CACHE#NODEPOD#"
 )
+
+// cacheNodePodPK returns the partition key under which the per-pod records for
+// the given node are stored. Each pod is its own DynamoDB item, keyed by pod
+// UID, so a node with N pods occupies N small items rather than one item that
+// would otherwise blow past the 400 KB DynamoDB limit.
+func cacheNodePodPK(nodeName string) string {
+	return cacheNodePodPrefix + nodeName
+}
 
 type CacheStore struct {
 	store DynamoMap
@@ -96,40 +105,49 @@ func (s *CacheStore) ListPodStates(ctx context.Context) (map[string]*PodStateRec
 	return out, nil
 }
 
-// ---------------------------  NODE  --------------------------- //
+// ---------------------------  NODE METADATA  --------------------------- //
 
-func (s *CacheStore) GetNode(ctx context.Context, nodeName string) (*NodeRecord, bool, int64, error) {
+// GetNodeMeta returns just the node-level metadata (no Pods loaded). Use
+// GetNode for an assembled view that includes the per-pod records.
+func (s *CacheStore) GetNodeMeta(ctx context.Context, nodeName string) (*NodeRecord, bool, int64, error) {
 	item, found, err := s.store.Get(ctx, cacheNodePK, nodeName)
 	if err != nil || !found {
 		return nil, found, 0, err
 	}
-	rec, err := unmarshalNodeRecord(item.Payload)
+	rec, err := unmarshalNodeMeta(item.Payload)
 	if err != nil {
 		return nil, false, 0, err
 	}
 	return rec, true, item.Version, nil
 }
 
-func (s *CacheStore) UpsertNode(ctx context.Context, nodeName string, rec *NodeRecord) error {
-	payload, err := marshalJSON(rec)
+// UpsertNodeMeta persists only the metadata fields of rec (Node, Generation,
+// UpdatedAt). The rec.Pods slice is intentionally ignored — pods are stored as
+// separate items via AddNodePod / RemoveNodePod.
+func (s *CacheStore) UpsertNodeMeta(ctx context.Context, nodeName string, rec *NodeRecord) error {
+	payload, err := marshalNodeMeta(rec)
 	if err != nil {
 		return err
 	}
 	return s.store.Upsert(ctx, cacheNodePK, nodeName, payload, nil)
 }
 
-func (s *CacheStore) DeleteNode(ctx context.Context, nodeName string) (bool, error) {
+// DeleteNodeMeta removes only the metadata item. Callers that want to fully
+// drop a node (including its per-pod items) should call DeleteNode.
+func (s *CacheStore) DeleteNodeMeta(ctx context.Context, nodeName string) (bool, error) {
 	return s.store.Delete(ctx, cacheNodePK, nodeName)
 }
 
-func (s *CacheStore) ListNodes(ctx context.Context) (map[string]*NodeRecord, error) {
+// ListNodeMeta returns the metadata for every known node, without loading any
+// per-pod records. Cheaper than ListNodes when the caller does not need pods.
+func (s *CacheStore) ListNodeMeta(ctx context.Context) (map[string]*NodeRecord, error) {
 	items, err := s.store.ListPartition(ctx, cacheNodePK)
 	if err != nil {
 		return nil, err
 	}
 	out := make(map[string]*NodeRecord, len(items))
 	for _, item := range items {
-		rec, err := unmarshalNodeRecord(item.Payload)
+		rec, err := unmarshalNodeMeta(item.Payload)
 		if err != nil {
 			continue
 		}
@@ -138,79 +156,114 @@ func (s *CacheStore) ListNodes(ctx context.Context) (map[string]*NodeRecord, err
 	return out, nil
 }
 
-// ---------------------------  POD  --------------------------- //
+// ---------------------------  NODE PODS  --------------------------- //
+
+// AddNodePod stores (or replaces) the record for a pod assigned to nodeName.
+// The pod is keyed by its UID; calling AddNodePod again for the same pod
+// overwrites the existing entry, matching the semantics of "the latest version
+// of this pod is what's on the node".
+func (s *CacheStore) AddNodePod(ctx context.Context, nodeName string, pod *corev1.Pod) error {
+	if pod == nil {
+		return fmt.Errorf("nil pod")
+	}
+	key, err := framework.GetPodKey(pod)
+	if err != nil {
+		return err
+	}
+	payload, err := marshalNodePod(pod)
+	if err != nil {
+		return err
+	}
+	return s.store.Upsert(ctx, cacheNodePodPK(nodeName), key, payload, nil)
+}
+
+// RemoveNodePod deletes the per-node record for the given pod key. Returns
+// false (without error) if the record was not present.
+func (s *CacheStore) RemoveNodePod(ctx context.Context, nodeName, podKey string) (bool, error) {
+	return s.store.Delete(ctx, cacheNodePodPK(nodeName), podKey)
+}
+
+// ListNodePods returns every pod currently recorded as scheduled on nodeName.
+func (s *CacheStore) ListNodePods(ctx context.Context, nodeName string) ([]*corev1.Pod, error) {
+	items, err := s.store.ListPartition(ctx, cacheNodePodPK(nodeName))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*corev1.Pod, 0, len(items))
+	for _, item := range items {
+		pod, err := unmarshalNodePod(item.Payload)
+		if err != nil {
+			continue
+		}
+		out = append(out, pod)
+	}
+	return out, nil
+}
+
+// CountNodePods returns the number of per-node pod records for nodeName
+// without paying to load and decode each item.
+func (s *CacheStore) CountNodePods(ctx context.Context, nodeName string) (int, error) {
+	return s.store.CountPartition(ctx, cacheNodePodPK(nodeName))
+}
+
+// ---------------------------  ASSEMBLED NODE  --------------------------- //
+
+// GetNode returns the node record assembled from its metadata item plus all
+// per-pod items. The returned NodeRecord has Pods populated.
+func (s *CacheStore) GetNode(ctx context.Context, nodeName string) (*NodeRecord, bool, int64, error) {
+	rec, found, version, err := s.GetNodeMeta(ctx, nodeName)
+	if err != nil || !found {
+		return nil, found, 0, err
+	}
+	pods, err := s.ListNodePods(ctx, nodeName)
+	if err != nil {
+		return nil, false, 0, err
+	}
+	rec.Pods = pods
+	return rec, true, version, nil
+}
+
+// ListNodes assembles every known node (metadata + pods).
+func (s *CacheStore) ListNodes(ctx context.Context) (map[string]*NodeRecord, error) {
+	metas, err := s.ListNodeMeta(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for name, rec := range metas {
+		pods, err := s.ListNodePods(ctx, name)
+		if err != nil {
+			return nil, err
+		}
+		rec.Pods = pods
+	}
+	return metas, nil
+}
+
+// DeleteNode removes the node entirely: every per-pod record under the node's
+// pod partition, then the metadata item itself. The boolean reflects whether
+// the metadata item existed.
+func (s *CacheStore) DeleteNode(ctx context.Context, nodeName string) (bool, error) {
+	pods, err := s.ListNodePods(ctx, nodeName)
+	if err != nil {
+		return false, err
+	}
+	for _, pod := range pods {
+		key, err := framework.GetPodKey(pod)
+		if err != nil {
+			continue
+		}
+		if _, err := s.store.Delete(ctx, cacheNodePodPK(nodeName), key); err != nil {
+			return false, fmt.Errorf("delete pod %s on node %s: %w", key, nodeName, err)
+		}
+	}
+	return s.DeleteNodeMeta(ctx, nodeName)
+}
+
+// ---------------------------  HELPERS  --------------------------- //
 
 func NewNodeRecord() *NodeRecord {
 	return &NodeRecord{
 		Pods:      []*corev1.Pod{},
 		UpdatedAt: time.Now(),
 	}
-}
-
-func (r *NodeRecord) AddPod(pod *corev1.Pod) error {
-	for _, existing := range r.Pods {
-		key1, _ := framework.GetPodKey(existing)
-		key2, _ := framework.GetPodKey(pod)
-		if key1 == key2 {
-			return fmt.Errorf("pod already exists on node")
-		}
-	}
-	r.Pods = append(r.Pods, pod)
-	r.Generation++
-	r.UpdatedAt = time.Now()
-	return nil
-}
-
-func (r *NodeRecord) ReplacePod(oldPod, newPod *corev1.Pod) error {
-	if oldPod == nil || newPod == nil {
-		return fmt.Errorf("oldPod and newPod are required")
-	}
-
-	oldKey, err := framework.GetPodKey(oldPod)
-	if err != nil {
-		return err
-	}
-	newKey, err := framework.GetPodKey(newPod)
-	if err != nil {
-		return err
-	}
-	if oldKey != newKey {
-		return fmt.Errorf("pod key mismatch during replace")
-	}
-
-	for i, existing := range r.Pods {
-		key, _ := framework.GetPodKey(existing)
-		if key == oldKey {
-			r.Pods[i] = newPod
-			r.Generation++
-			r.UpdatedAt = time.Now()
-			return nil
-		}
-	}
-
-	return fmt.Errorf("pod not found on node")
-}
-
-func (r *NodeRecord) RemovePod(pod *corev1.Pod) error {
-	key, err := framework.GetPodKey(pod)
-	if err != nil {
-		return err
-	}
-	next := make([]*corev1.Pod, 0, len(r.Pods))
-	found := false
-	for _, p := range r.Pods {
-		k, _ := framework.GetPodKey(p)
-		if k == key {
-			found = true
-			continue
-		}
-		next = append(next, p)
-	}
-	if !found {
-		return fmt.Errorf("pod not found on node")
-	}
-	r.Pods = next
-	r.Generation++
-	r.UpdatedAt = time.Now()
-	return nil
 }

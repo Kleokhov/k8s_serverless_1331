@@ -108,6 +108,9 @@ type Cache interface {
 	// UpdateSnapshot returns the current set of non-deleted nodes in the cache.
 	UpdateSnapshot(logger klog.Logger) (map[string]*framework.NodeInfo, error)
 
+	// GetNodeInfo returns a snapshot of one non-deleted node from the cache.
+	GetNodeInfo(logger klog.Logger, nodeName string) (*framework.NodeInfo, bool, error)
+
 	// Dump produces a dump of the current cache.
 	Dump() *Dump
 }
